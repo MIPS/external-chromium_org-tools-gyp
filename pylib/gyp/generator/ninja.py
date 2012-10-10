@@ -4,8 +4,10 @@
 
 import copy
 import hashlib
+import multiprocessing
 import os.path
 import re
+import signal
 import subprocess
 import sys
 import gyp
@@ -366,6 +368,8 @@ class NinjaWriter:
     self.toolset = spec['toolset']
     config = spec['configurations'][config_name]
     self.target = Target(spec['type'])
+    self.is_standalone_static_library = bool(
+        spec.get('standalone_static_library', 0))
 
     self.is_mac_bundle = gyp.xcode_emulation.IsMacBundle(self.flavor, spec)
     self.xcode_settings = self.msvs_settings = None
@@ -952,8 +956,13 @@ class NinjaWriter:
       if self.xcode_settings:
         variables.append(('libtool_flags',
                           self.xcode_settings.GetLibtoolflags(config_name)))
-      self.ninja.build(self.target.binary, 'alink', link_deps,
-                       order_only=compile_deps, variables=variables)
+      if (self.flavor not in ('mac', 'win') and not
+          self.is_standalone_static_library):
+        self.ninja.build(self.target.binary, 'alink_thin', link_deps,
+                         order_only=compile_deps, variables=variables)
+      else:
+        self.ninja.build(self.target.binary, 'alink', link_deps,
+                         order_only=compile_deps, variables=variables)
     else:
       self.WriteLink(spec, config_name, config, link_deps)
     return self.target.binary
@@ -1137,7 +1146,7 @@ class NinjaWriter:
     elif self.flavor == 'win' and self.toolset == 'target':
       type_in_output_root += ['shared_library']
 
-    if type in type_in_output_root:
+    if type in type_in_output_root or self.is_standalone_static_library:
       return filename
     elif type == 'shared_library':
       libdir = 'lib'
@@ -1494,6 +1503,10 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.rule(
       'alink',
       description='AR $out',
+      command='rm -f $out && $ar rcs $out $in')
+    master_ninja.rule(
+      'alink_thin',
+      description='AR $out',
       command='rm -f $out && $ar rcsT $out $in')
 
     # This allows targets that only need to depend on $lib's API to declare an
@@ -1736,6 +1749,15 @@ def PerformBuild(data, configurations, params):
     subprocess.check_call(arguments)
 
 
+def CallGenerateOutputForConfig(arglist):
+  # Ignore the interrupt signal so that the parent process catches it and
+  # kills all multiprocessing children.
+  signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+  (target_list, target_dicts, data, params, config_name) = arglist
+  GenerateOutputForConfig(target_list, target_dicts, data, params, config_name)
+
+
 def GenerateOutput(target_list, target_dicts, data, params):
   user_config = params.get('generator_flags', {}).get('config', None)
   if user_config:
@@ -1743,6 +1765,18 @@ def GenerateOutput(target_list, target_dicts, data, params):
                             user_config)
   else:
     config_names = target_dicts[target_list[0]]['configurations'].keys()
-    for config_name in config_names:
-      GenerateOutputForConfig(target_list, target_dicts, data, params,
-                              config_name)
+    if params['parallel']:
+      try:
+        pool = multiprocessing.Pool(len(config_names))
+        arglists = []
+        for config_name in config_names:
+          arglists.append(
+              (target_list, target_dicts, data, params, config_name))
+          pool.map(CallGenerateOutputForConfig, arglists)
+      except KeyboardInterrupt, e:
+        pool.terminate()
+        raise e
+    else:
+      for config_name in config_names:
+        GenerateOutputForConfig(target_list, target_dicts, data, params,
+                                config_name)
