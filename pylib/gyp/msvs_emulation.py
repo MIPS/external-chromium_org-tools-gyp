@@ -277,6 +277,16 @@ class MsvsSettings(object):
           output_file, config=config))
     return output_file
 
+  def GetPDBName(self, config, expand_special):
+    """Gets the explicitly overridden pdb name for a target or returns None
+    if it's not overridden."""
+    config = self._RealConfig(config)
+    output_file = self._Setting(('VCLinkerTool', 'ProgramDatabaseFile'), config)
+    if output_file:
+      output_file = expand_special(self.ConvertVSMacros(
+          output_file, config=config))
+    return output_file
+
   def GetCflags(self, config):
     """Returns the flags that need to be added to .c and .cc compilations."""
     config = self._RealConfig(config)
@@ -388,6 +398,9 @@ class MsvsSettings(object):
     out = self.GetOutputName(config, expand_special)
     if out:
       ldflags.append('/OUT:' + out)
+    pdb = self.GetPDBName(config, expand_special)
+    if pdb:
+      ldflags.append('/PDB:' + pdb)
     ld('AdditionalOptions', prefix='')
     ld('SubSystem', map={'1': 'CONSOLE', '2': 'WINDOWS'}, prefix='/SUBSYSTEM:')
     ld('LinkIncremental', map={'1': ':NO', '2': ''}, prefix='/INCREMENTAL')
@@ -402,6 +415,7 @@ class MsvsSettings(object):
     ld('IgnoreDefaultLibraryNames', prefix='/NODEFAULTLIB:')
     ld('ResourceOnlyDLL', map={'true': '/NOENTRY'})
     ld('EntryPointSymbol', prefix='/ENTRY:')
+    ld('Profile', map={ 'true': '/PROFILE'})
     # TODO(scottmg): This should sort of be somewhere else (not really a flag).
     ld('AdditionalDependencies', prefix='')
     # TODO(scottmg): These too.
@@ -690,3 +704,19 @@ def GenerateEnvironmentFiles(toplevel_build_dir, generator_flags, open_out):
     f = open_out(os.path.join(toplevel_build_dir, 'environment.' + arch), 'wb')
     f.write(env_block)
     f.close()
+
+def VerifyMissingSources(sources, build_dir, generator_flags, gyp_to_ninja):
+  """Emulate behavior of msvs_error_on_missing_sources present in the msvs
+  generator: Check that all regular source files, i.e. not created at run time,
+  exist on disk. Missing files cause needless recompilation when building via
+  VS, and we want this check to match for people/bots that build using ninja,
+  so they're not surprised when the VS build fails."""
+  if int(generator_flags.get('msvs_error_on_missing_sources', 0)):
+    no_specials = filter(lambda x: '$' not in x, sources)
+    relative = [os.path.join(build_dir, gyp_to_ninja(s)) for s in no_specials]
+    missing = filter(lambda x: not os.path.exists(x), relative)
+    if missing:
+      # They'll look like out\Release\..\..\stuff\things.cc, so normalize the
+      # path for a slightly less crazy looking output.
+      cleaned_up = [os.path.normpath(x) for x in missing]
+      raise Exception('Missing input files:\n%s' % '\n'.join(cleaned_up))
