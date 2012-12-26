@@ -19,6 +19,7 @@ import gyp.common
 import gyp.generator.make as make  # Reuse global functions from make backend.
 import os
 import re
+import subprocess
 
 generator_default_variables = {
   'OS': 'android',
@@ -38,7 +39,7 @@ generator_default_variables = {
   'RULE_INPUT_PATH': '$(RULE_SOURCES)',
   'RULE_INPUT_EXT': '$(suffix $<)',
   'RULE_INPUT_NAME': '$(notdir $<)',
-  'CONFIGURATION_NAME': 'NOT_USED_ON_ANDROID',
+  'CONFIGURATION_NAME': '$(GYP_DEFAULT_CONFIGURATION)',
 }
 
 # Make supports multiple toolsets
@@ -940,30 +941,16 @@ class AndroidMkWriter(object):
     return path
 
 
-def WriteAutoRegenerationRule(params, root_makefile, makefile_name,
-                              build_files):
-  """Write the target to regenerate the Makefile."""
+def PerformBuild(data, configurations, params):
+  # The android backend only supports the default configuration.
   options = params['options']
-  # Sort to avoid non-functional changes to makefile.
-  build_files = sorted([os.path.join('$(LOCAL_PATH)', f) for f in build_files])
-  build_files_args = [gyp.common.RelativePath(filename, options.toplevel_dir)
-                      for filename in params['build_files_arg']]
-  build_files_args = [os.path.join('$(PRIVATE_LOCAL_PATH)', f)
-                      for f in build_files_args]
-  gyp_binary = gyp.common.FixIfRelativePath(params['gyp_binary'],
-                                            options.toplevel_dir)
-  makefile_path = os.path.join('$(LOCAL_PATH)', makefile_name)
-  if not gyp_binary.startswith(os.sep):
-    gyp_binary = os.path.join('.', gyp_binary)
-  root_makefile.write('GYP_FILES := \\\n  %s\n\n' %
-                      '\\\n  '.join(map(Sourceify, build_files)))
-  root_makefile.write('%s: PRIVATE_LOCAL_PATH := $(LOCAL_PATH)\n' %
-                      makefile_path)
-  root_makefile.write('%s: $(GYP_FILES)\n' % makefile_path)
-  root_makefile.write('\techo ACTION Regenerating $@\n\t%s\n\n' %
-      gyp.common.EncodePOSIXShellList([gyp_binary, '-fandroid'] +
-                                      gyp.RegenerateFlags(options) +
-                                      build_files_args))
+  makefile = os.path.abspath(os.path.join(options.toplevel_dir,
+                                          'GypAndroid.mk'))
+  env = dict(os.environ)
+  env['ONE_SHOT_MAKEFILE'] = makefile
+  arguments = ['make', '-C', os.environ['ANDROID_BUILD_TOP'], 'gyp_all_modules']
+  print 'Building: %s' % arguments
+  subprocess.check_call(arguments, env=env)
 
 
 def GenerateOutput(target_list, target_dicts, data, params):
@@ -1077,15 +1064,14 @@ def GenerateOutput(target_list, target_dicts, data, params):
 
   # Some tools need to know the absolute path of the top directory.
   root_makefile.write('GYP_ABS_ANDROID_TOP_DIR := $(shell pwd)\n')
+  root_makefile.write('GYP_DEFAULT_CONFIGURATION := %s\n' %
+                      default_configuration)
 
   # Write out the sorted list of includes.
   root_makefile.write('\n')
   for include_file in sorted(include_list):
     root_makefile.write('include $(LOCAL_PATH)/' + include_file + '\n')
   root_makefile.write('\n')
-
-  if generator_flags.get('auto_regeneration', True):
-    WriteAutoRegenerationRule(params, root_makefile, makefile_name, build_files)
 
   root_makefile.write(SHARED_FOOTER)
 

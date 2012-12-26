@@ -5,15 +5,15 @@
 {
   'targets': [
     {
-      'target_name': 'my_target',
+      'target_name': 'test_default_char_is_unsigned',
       'type': 'executable',
       'msvs_settings': {
         'VCCLCompilerTool': {
-          'ForcedIncludeFiles': ['string', 'vector', 'list'],
+          'DefaultCharIsUnsigned': 'true',
         },
       },
       'sources': [
-        'hello.cc',
+        'default-char-is-unsigned.cc',
       ],
     },
   ],

@@ -168,8 +168,6 @@ class MsvsSettings(object):
     equivalents."""
     target_platform = 'Win32' if self.GetArch(config) == 'x86' else 'x64'
     replacements = {
-        '$(VSInstallDir)': self.vs_version.Path(),
-        '$(VCInstallDir)': os.path.join(self.vs_version.Path(), 'VC') + '\\',
         '$(OutDir)\\': base_to_build + '\\' if base_to_build else '',
         '$(IntDir)': '$!INTERMEDIATE_DIR',
         '$(InputPath)': '${source}',
@@ -178,6 +176,12 @@ class MsvsSettings(object):
         '$(PlatformName)': target_platform,
         '$(ProjectDir)\\': '',
     }
+    # '$(VSInstallDir)' and '$(VCInstallDir)' are available when and only when
+    # Visual Studio is actually installed.
+    if self.vs_version.Path():
+      replacements['$(VSInstallDir)'] = self.vs_version.Path()
+      replacements['$(VCInstallDir)'] = os.path.join(self.vs_version.Path(),
+                                                     'VC') + '\\'
     # Chromium uses DXSDK_DIR in include/lib paths, but it may or may not be
     # set. This happens when the SDK is sync'd via src-internal, rather than
     # by typical end-user installation of the SDK. If it's not set, we don't
@@ -309,6 +313,7 @@ class MsvsSettings(object):
        map={'0': 'd', '1': '1', '2': '2', '3': 'x'}, prefix='/O')
     cl('InlineFunctionExpansion', prefix='/Ob')
     cl('OmitFramePointers', map={'false': '-', 'true': ''}, prefix='/Oy')
+    cl('EnableIntrinsicFunctions', map={'false': '-', 'true': ''}, prefix='/Oi')
     cl('FavorSizeOrSpeed', map={'1': 't', '2': 's'}, prefix='/O')
     cl('WholeProgramOptimization', map={'true': '/GL'})
     cl('WarningLevel', prefix='/W')
@@ -323,6 +328,9 @@ class MsvsSettings(object):
     cl('RuntimeLibrary',
         map={'0': 'T', '1': 'Td', '2': 'D', '3': 'Dd'}, prefix='/M')
     cl('ExceptionHandling', map={'1': 'sc','2': 'a'}, prefix='/EH')
+    cl('DefaultCharIsUnsigned', map={'true': '/J'})
+    cl('TreatWChar_tAsBuiltInType',
+        map={'false': '-', 'true': ''}, prefix='/Zc:wchar_t')
     cl('EnablePREfast', map={'true': '/analyze'})
     cl('AdditionalOptions', prefix='')
     cflags.extend(['/FI' + f for f in self._Setting(
@@ -380,6 +388,7 @@ class MsvsSettings(object):
                           'VCLibrarianTool', append=libflags)
     libflags.extend(self._GetAdditionalLibraryDirectories(
         'VCLibrarianTool', config, gyp_to_build_path))
+    lib('LinkTimeCodeGeneration', map={'true': '/LTCG'})
     lib('AdditionalOptions')
     return libflags
 
@@ -416,6 +425,7 @@ class MsvsSettings(object):
       ldflags.append('/PDB:' + pdb)
     ld('AdditionalOptions', prefix='')
     ld('SubSystem', map={'1': 'CONSOLE', '2': 'WINDOWS'}, prefix='/SUBSYSTEM:')
+    ld('TerminalServerAware', map={'1': ':NO', '2': ''}, prefix='/TSAWARE')
     ld('LinkIncremental', map={'1': ':NO', '2': ''}, prefix='/INCREMENTAL')
     ld('FixedBaseAddress', map={'1': ':NO', '2': ''}, prefix='/FIXED')
     ld('RandomizedBaseAddress',
@@ -428,7 +438,9 @@ class MsvsSettings(object):
     ld('IgnoreDefaultLibraryNames', prefix='/NODEFAULTLIB:')
     ld('ResourceOnlyDLL', map={'true': '/NOENTRY'})
     ld('EntryPointSymbol', prefix='/ENTRY:')
-    ld('Profile', map={ 'true': '/PROFILE'})
+    ld('Profile', map={'true': '/PROFILE'})
+    ld('LargeAddressAware',
+        map={'1': ':NO', '2': ''}, prefix='/LARGEADDRESSAWARE')
     # TODO(scottmg): This should sort of be somewhere else (not really a flag).
     ld('AdditionalDependencies', prefix='')
     # TODO(scottmg): These too.
@@ -713,7 +725,13 @@ def GenerateEnvironmentFiles(toplevel_build_dir, generator_flags, open_out):
   of compiler tools (cl, link, lib, rc, midl, etc.) via win_tool.py which
   sets up the environment, and then we do not prefix the compiler with
   an absolute path, instead preferring something like "cl.exe" in the rule
-  which will then run whichever the environment setup has put in the path."""
+  which will then run whichever the environment setup has put in the path.
+  When the following procedure to generate environment files does not
+  meet your requirement (e.g. for custom toolchains), you can pass
+  "-G ninja_use_custom_environment_files" to the gyp to suppress file
+  generation and use custom environment files prepared by yourself."""
+  if generator_flags.get('ninja_use_custom_environment_files', 0):
+    return
   vs = GetVSVersion(generator_flags)
   for arch in ('x86', 'x64'):
     args = vs.SetupScript(arch)
