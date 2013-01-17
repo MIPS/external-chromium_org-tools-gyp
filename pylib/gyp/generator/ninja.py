@@ -1,4 +1,4 @@
-# Copyright (c) 2012 Google Inc. All rights reserved.
+# Copyright (c) 2013 Google Inc. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
@@ -733,7 +733,15 @@ class NinjaWriter:
       cflags_c = self.msvs_settings.GetCflagsC(config_name)
       cflags_cc = self.msvs_settings.GetCflagsCC(config_name)
       extra_defines = self.msvs_settings.GetComputedDefines(config_name)
-      self.WriteVariableList('pdbname', [self.name + '.pdb'])
+      pdbpath = self.msvs_settings.GetCompilerPdbName(
+          config_name, self.ExpandSpecial)
+      if not pdbpath:
+        obj = 'obj'
+        if self.toolset != 'target':
+          obj += '.' + self.toolset
+        pdbpath = os.path.normpath(os.path.join(obj, self.base_dir,
+                                                self.name + '.pdb'))
+      self.WriteVariableList('pdbname', [pdbpath])
       self.WriteVariableList('pchprefix', [self.name])
     else:
       cflags = config.get('cflags', [])
@@ -893,12 +901,12 @@ class NinjaWriter:
       extra_bindings.append(('postbuilds',
                              self.GetPostbuildCommand(spec, output, output)))
 
+    is_executable = spec['type'] == 'executable'
     if self.flavor == 'mac':
       ldflags = self.xcode_settings.GetLdflags(config_name,
           self.ExpandSpecial(generator_default_variables['PRODUCT_DIR']),
           self.GypPathToNinja)
     elif self.flavor == 'win':
-      is_executable = spec['type'] == 'executable'
       manifest_name = self.GypPathToUniqueOutput(
           self.ComputeOutputFileName(spec))
       ldflags, manifest_files = self.msvs_settings.GetLdflags(config_name,
@@ -906,6 +914,8 @@ class NinjaWriter:
       self.WriteVariableList('manifests', manifest_files)
     else:
       ldflags = config.get('ldflags', [])
+      if is_executable and len(solibs):
+        ldflags.append('-Wl,-rpath=\$$ORIGIN/lib/')
     self.WriteVariableList('ldflags',
                            gyp.common.uniquer(map(self.ExpandSpecial,
                                                   ldflags)))
@@ -1550,7 +1560,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.rule(
       'link',
       description='LINK $out',
-      command=('$ld $ldflags -o $out -Wl,-rpath=\$$ORIGIN/lib '
+      command=('$ld $ldflags -o $out '
                '-Wl,--start-group $in $solibs -Wl,--end-group $libs'))
   elif flavor == 'win':
     master_ninja.rule(
