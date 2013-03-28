@@ -383,7 +383,7 @@ class TestGypAndroid(TestGypBase):
   ALL = 'gyp_all_modules'
 
   def __init__(self, gyp=None, *args, **kw):
-    # Android requires build and test output to be outside its source tree.
+    # Android requires build and test output to be inside its source tree.
     # We use the following working directory for the test's source, but the
     # test's build output still goes to $ANDROID_PRODUCT_OUT.
     # Note that some tests explicitly set format='gypd' to invoke the gypd
@@ -961,6 +961,7 @@ class TestGypXcode(TestGypBase):
   up_to_date_endings = (
     'Checking Dependencies...\n** BUILD SUCCEEDED **\n', # Xcode 3.0/3.1
     'Check dependencies\n** BUILD SUCCEEDED **\n\n',     # Xcode 3.2
+    'Check dependencies\n\n\n** BUILD SUCCEEDED **\n\n', # Xcode 4.2
   )
 
   def build(self, gyp_file, target=None, **kw):
