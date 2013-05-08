@@ -763,8 +763,9 @@ class NinjaWriter:
     if self.flavor == 'win':
       include_dirs = self.msvs_settings.AdjustIncludeDirs(include_dirs,
                                                           config_name)
+    env = self.GetSortedXcodeEnv()
     self.WriteVariableList('includes',
-        [QuoteShellArgument('-I' + self.GypPathToNinja(i), self.flavor)
+        [QuoteShellArgument('-I' + self.GypPathToNinja(i, env), self.flavor)
          for i in include_dirs])
 
     pch_commands = precompiled_header.GetPchBuildCommands()
@@ -1038,13 +1039,15 @@ class NinjaWriter:
     if not self.xcode_settings or spec['type'] == 'none' or not output:
       return ''
     output = QuoteShellArgument(output, self.flavor)
-    target_postbuilds = self.xcode_settings.GetTargetPostbuilds(
-        self.config_name,
-        os.path.normpath(os.path.join(self.base_to_build, output)),
-        QuoteShellArgument(
-            os.path.normpath(os.path.join(self.base_to_build, output_binary)),
-            self.flavor),
-        quiet=True)
+    target_postbuilds = []
+    if output_binary is not None:
+      target_postbuilds = self.xcode_settings.GetTargetPostbuilds(
+          self.config_name,
+          os.path.normpath(os.path.join(self.base_to_build, output)),
+          QuoteShellArgument(
+              os.path.normpath(os.path.join(self.base_to_build, output_binary)),
+              self.flavor),
+          quiet=True)
     postbuilds = gyp.xcode_emulation.GetSpecPostbuildCommands(spec, quiet=True)
     postbuilds = target_postbuilds + postbuilds
     if not postbuilds:
@@ -1369,8 +1372,11 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   #   'CC_host'/'CXX_host' enviroment variable, cc_host/cxx_host should be set
   #   to cc/cxx.
   if flavor == 'win':
-    cc = 'UNKNOWN'  # Must be overridden by local arch choice.
-    cxx = 'UNKNOWN'
+    # Overridden by local arch choice in the use_deps case.
+    # Chromium's ffmpeg c99conv.py currently looks for a 'cc =' line in
+    # build.ninja so needs something valid here. http://crbug.com/233985
+    cc = 'cl.exe'
+    cxx = 'cl.exe'
     ld = 'link.exe'
     ld_host = '$ld'
   else:
@@ -1821,7 +1827,7 @@ def GenerateOutput(target_list, target_dicts, data, params):
         for config_name in config_names:
           arglists.append(
               (target_list, target_dicts, data, params, config_name))
-          pool.map(CallGenerateOutputForConfig, arglists)
+        pool.map(CallGenerateOutputForConfig, arglists)
       except KeyboardInterrupt, e:
         pool.terminate()
         raise e
