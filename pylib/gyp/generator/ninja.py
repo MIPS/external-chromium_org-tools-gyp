@@ -977,7 +977,7 @@ class NinjaWriter:
       if self.xcode_settings:
         variables.append(('libtool_flags',
                           self.xcode_settings.GetLibtoolflags(config_name)))
-      if (self.flavor not in ('mac', 'win') and not
+      if (self.flavor not in ('mac', 'openbsd', 'win') and not
           self.is_standalone_static_library):
         self.ninja.build(self.target.binary, 'alink_thin', link_deps,
                          order_only=compile_deps, variables=variables)
@@ -1420,15 +1420,18 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
 
   # Support wrappers from environment variables too.
   for key, value in os.environ.iteritems():
-    if key.endswith('_wrapper'):
-      wrappers[key[:-len('_wrapper')]] = os.path.join(build_to_root, value)
+    if key.lower().endswith('_wrapper'):
+      key_prefix = key[:-len('_wrapper')]
+      key_prefix = re.sub(r'\.HOST$', '.host', key_prefix)
+      wrappers[key_prefix] = os.path.join(build_to_root, value)
 
   if flavor == 'win':
     cl_paths = gyp.msvs_emulation.GenerateEnvironmentFiles(
         toplevel_build, generator_flags, OpenOutput)
     for arch, path in cl_paths.iteritems():
-      master_ninja.variable('cl_' + arch,
-                            CommandWithWrapper('CC', wrappers, path))
+      master_ninja.variable(
+          'cl_' + arch, CommandWithWrapper('CC', wrappers,
+                                           QuoteShellArgument(path, flavor)))
 
   cc = GetEnvironFallback(['CC_target', 'CC'], cc)
   master_ninja.variable('cc', CommandWithWrapper('CC', wrappers, cc))
@@ -1478,6 +1481,8 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   deps = None
   if int(generator_flags.get('use_deps', '0')) and flavor != 'win':
     deps = 'gcc'
+  if int(generator_flags.get('use_deps', '0')) and flavor == 'win':
+    deps = 'msvc'
 
   if flavor != 'win':
     master_ninja.rule(
@@ -1500,11 +1505,12 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       depfile='$out.d',
       deps=deps)
   else:
-    cc_command = ('ninja -t msvc -o $out -e $arch '
+    deps_cmd = '-o $out ' if not deps else ''
+    cc_command = (('ninja -t msvc %s-e $arch ' % deps_cmd) +
                   '-- '
                   '$cc /nologo /showIncludes /FC '
                   '@$out.rsp /c $in /Fo$out /Fd$pdbname ')
-    cxx_command = ('ninja -t msvc -o $out -e $arch '
+    cxx_command = (('ninja -t msvc %s-e $arch ' % deps_cmd) +
                    '-- '
                    '$cxx /nologo /showIncludes /FC '
                    '@$out.rsp /c $in /Fo$out /Fd$pdbname ')
@@ -1514,14 +1520,16 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       command=cc_command,
       depfile='$out.d',
       rspfile='$out.rsp',
-      rspfile_content='$defines $includes $cflags $cflags_c')
+      rspfile_content='$defines $includes $cflags $cflags_c',
+      deps=deps)
     master_ninja.rule(
       'cxx',
       description='CXX $out',
       command=cxx_command,
       depfile='$out.d',
       rspfile='$out.rsp',
-      rspfile_content='$defines $includes $cflags $cflags_cc')
+      rspfile_content='$defines $includes $cflags $cflags_cc',
+      deps=deps)
     master_ninja.rule(
       'idl',
       description='IDL $in',

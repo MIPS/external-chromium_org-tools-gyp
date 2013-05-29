@@ -292,11 +292,9 @@ class AndroidMkWriter(object):
       main_output = make.QuoteSpaces(self.LocalPathify(outputs[0]))
       self.WriteLn('%s: gyp_local_path := $(LOCAL_PATH)' % main_output)
       self.WriteLn('%s: gyp_intermediate_dir := '
-                   '$(GYP_ABS_ANDROID_TOP_DIR)/$(gyp_intermediate_dir)' %
-                   main_output)
+                   '$(abspath $(gyp_intermediate_dir))' % main_output)
       self.WriteLn('%s: gyp_shared_intermediate_dir := '
-                   '$(GYP_ABS_ANDROID_TOP_DIR)/$(gyp_shared_intermediate_dir)' %
-                   main_output)
+                   '$(abspath $(gyp_shared_intermediate_dir))' % main_output)
 
       # Android's envsetup.sh adds a number of directories to the path including
       # the built host binary directory. This causes actions/rules invoked by
@@ -394,11 +392,9 @@ class AndroidMkWriter(object):
         main_output = outputs[0]
         self.WriteLn('%s: gyp_local_path := $(LOCAL_PATH)' % main_output)
         self.WriteLn('%s: gyp_intermediate_dir := '
-                     '$(GYP_ABS_ANDROID_TOP_DIR)/$(gyp_intermediate_dir)'
-                     % main_output)
+                     '$(abspath $(gyp_intermediate_dir))' % main_output)
         self.WriteLn('%s: gyp_shared_intermediate_dir := '
-                     '$(GYP_ABS_ANDROID_TOP_DIR)/$(gyp_shared_intermediate_dir)'
-                     % main_output)
+                     '$(abspath $(gyp_shared_intermediate_dir))' % main_output)
 
         # See explanation in WriteActions.
         self.WriteLn('%s: export PATH := '
@@ -413,7 +409,9 @@ class AndroidMkWriter(object):
                      (main_output, main_output_deps))
         self.WriteLn('\t%s\n' % command)
         for output in outputs[1:]:
-          self.WriteLn('%s: %s' % (output, main_output))
+          # Make each output depend on the main output, with an empty command
+          # to force make to notice that the mtime has changed.
+          self.WriteLn('%s: %s ;' % (output, main_output))
         self.WriteLn('.PHONY: %s' % (rule_trigger))
         self.WriteLn('%s: %s' % (rule_trigger, main_output))
         self.WriteLn('')
@@ -1064,8 +1062,6 @@ def GenerateOutput(target_list, target_dicts, data, params):
                                               os.path.dirname(makefile_path))
     include_list.add(mkfile_rel_path)
 
-  # Some tools need to know the absolute path of the top directory.
-  root_makefile.write('GYP_ABS_ANDROID_TOP_DIR := $(shell pwd)\n')
   root_makefile.write('GYP_DEFAULT_CONFIGURATION := %s\n' %
                       default_configuration)
 
