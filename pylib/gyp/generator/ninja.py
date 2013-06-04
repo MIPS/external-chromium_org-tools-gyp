@@ -609,6 +609,7 @@ class NinjaWriter:
 
       # For each source file, write an edge that generates all the outputs.
       for source in rule.get('rule_sources', []):
+        source = os.path.normpath(source)
         dirname, basename = os.path.split(source)
         root, ext = os.path.splitext(basename)
 
@@ -630,7 +631,11 @@ class NinjaWriter:
           if var == 'root':
             extra_bindings.append(('root', cygwin_munge(root)))
           elif var == 'dirname':
-            extra_bindings.append(('dirname', cygwin_munge(dirname)))
+            # '$dirname' is a parameter to the rule action, which means
+            # it shouldn't be converted to a Ninja path.  But we don't
+            # want $!PRODUCT_DIR in there either.
+            dirname_expanded = self.ExpandSpecial(dirname, self.base_to_build)
+            extra_bindings.append(('dirname', cygwin_munge(dirname_expanded)))
           elif var == 'source':
             # '$source' is a parameter to the rule action, which means
             # it shouldn't be converted to a Ninja path.  But we don't
@@ -1479,9 +1484,9 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   master_ninja.newline()
 
   deps = None
-  if flavor != 'win':
+  if int(generator_flags.get('use_deps', '0')) and flavor != 'win':
     deps = 'gcc'
-  elif int(generator_flags.get('use_deps', '0')):
+  if int(generator_flags.get('use_deps', '0')) and flavor == 'win':
     deps = 'msvc'
 
   if flavor != 'win':
