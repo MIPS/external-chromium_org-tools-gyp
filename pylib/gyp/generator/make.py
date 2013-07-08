@@ -1,4 +1,4 @@
-# Copyright (c) 2012 Google Inc. All rights reserved.
+# Copyright (c) 2013 Google Inc. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
 
@@ -1425,6 +1425,8 @@ $(obj).$(TOOLSET)/$(TARGET)/%%.o: $(obj)/%%%s FORCE_DO_CMD
             ldflags.append(r'-Wl,-rpath=\$$ORIGIN/lib.%s/' % self.toolset)
             ldflags.append(r'-Wl,-rpath-link=\$(builddir)/lib.%s/' %
                            self.toolset)
+        library_dirs = config.get('library_dirs', [])
+        ldflags += [('-L%s' % library_dir) for library_dir in library_dirs]
         self.WriteList(ldflags, 'LDFLAGS_%s' % configname)
         if self.flavor == 'mac':
           self.WriteList(self.xcode_settings.GetLibtoolflags(configname),
@@ -1887,13 +1889,15 @@ def WriteAutoRegenerationRule(params, root_makefile, makefile_name,
   options = params['options']
   build_files_args = [gyp.common.RelativePath(filename, options.toplevel_dir)
                       for filename in params['build_files_arg']]
+
   gyp_binary = gyp.common.FixIfRelativePath(params['gyp_binary'],
                                             options.toplevel_dir)
   if not gyp_binary.startswith(os.sep):
     gyp_binary = os.path.join('.', gyp_binary)
+
   root_makefile.write(
       "quiet_cmd_regen_makefile = ACTION Regenerating $@\n"
-      "cmd_regen_makefile = %(cmd)s\n"
+      "cmd_regen_makefile = cd $(srcdir); %(cmd)s\n"
       "%(makefile_name)s: %(deps)s\n"
       "\t$(call do_cmd,regen_makefile)\n\n" % {
           'makefile_name': makefile_name,
