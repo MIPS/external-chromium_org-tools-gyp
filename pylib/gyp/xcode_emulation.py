@@ -308,6 +308,11 @@ class XcodeSettings(object):
       else:
         raise NotImplementedError('Unknown debug format %s' % dbg_format)
 
+    if self._Settings().get('GCC_STRICT_ALIASING') == 'YES':
+      cflags.append('-fstrict-aliasing')
+    elif self._Settings().get('GCC_STRICT_ALIASING') == 'NO':
+      cflags.append('-fno-strict-aliasing')
+
     if self._Test('GCC_SYMBOLS_PRIVATE_EXTERN', 'YES', default='NO'):
       cflags.append('-fvisibility=hidden')
 
@@ -888,7 +893,7 @@ def GetMacBundleResources(product_dir, xcode_settings, resources):
 
 def GetMacInfoPlist(product_dir, xcode_settings, gyp_path_to_build_path):
   """Returns (info_plist, dest_plist, defines, extra_env), where:
-  * |info_plist| is the sourc plist path, relative to the
+  * |info_plist| is the source plist path, relative to the
     build directory,
   * |dest_plist| is the destination plist path, relative to the
     build directory,
