@@ -167,12 +167,17 @@ class MsvsSettings(object):
     """Get a dict of variables mapping internal VS macro names to their gyp
     equivalents."""
     target_platform = 'Win32' if self.GetArch(config) == 'x86' else 'x64'
+    target_name = self.spec.get('product_prefix', '') + \
+        self.spec.get('product_name', self.spec['target_name'])
+    target_dir = base_to_build + '\\' if base_to_build else ''
     replacements = {
-        '$(OutDir)\\': base_to_build + '\\' if base_to_build else '',
+        '$(OutDir)\\': target_dir,
+        '$(TargetDir)\\': target_dir,
         '$(IntDir)': '$!INTERMEDIATE_DIR',
         '$(InputPath)': '${source}',
         '$(InputName)': '${root}',
         '$(ProjectName)': self.spec['target_name'],
+        '$(TargetName)': target_name,
         '$(PlatformName)': target_platform,
         '$(ProjectDir)\\': '',
     }
@@ -289,6 +294,15 @@ class MsvsSettings(object):
       pdbname = expand_special(self.ConvertVSMacros(pdbname))
     return pdbname
 
+  def GetMapFileName(self, config, expand_special):
+    """Gets the explicitly overriden map file name for a target or returns None
+    if it's not set."""
+    config = self._TargetConfig(config)
+    map_file = self._Setting(('VCLinkerTool', 'MapFileName'), config)
+    if map_file:
+      map_file = expand_special(self.ConvertVSMacros(map_file, config=config))
+    return map_file
+
   def GetOutputName(self, config, expand_special):
     """Gets the explicitly overridden output name for a target or returns None
     if it's not overridden."""
@@ -322,6 +336,8 @@ class MsvsSettings(object):
     cl('Optimization',
        map={'0': 'd', '1': '1', '2': '2', '3': 'x'}, prefix='/O')
     cl('InlineFunctionExpansion', prefix='/Ob')
+    cl('StringPooling', map={'true': '/GF'})
+    cl('EnableFiberSafeOptimizations', map={'true': '/GT'})
     cl('OmitFramePointers', map={'false': '-', 'true': ''}, prefix='/Oy')
     cl('EnableIntrinsicFunctions', map={'false': '-', 'true': ''}, prefix='/Oi')
     cl('FavorSizeOrSpeed', map={'1': 't', '2': 's'}, prefix='/O')
@@ -440,6 +456,10 @@ class MsvsSettings(object):
     pdb = self.GetPDBName(config, expand_special)
     if pdb:
       ldflags.append('/PDB:' + pdb)
+    map_file = self.GetMapFileName(config, expand_special)
+    ld('GenerateMapFile', map={'true': '/MAP:' + map_file if map_file
+        else '/MAP'})
+    ld('MapExports', map={'true': '/MAPINFO:EXPORTS'})
     ld('AdditionalOptions', prefix='')
     ld('SubSystem', map={'1': 'CONSOLE', '2': 'WINDOWS'}, prefix='/SUBSYSTEM:')
     ld('TerminalServerAware', map={'1': ':NO', '2': ''}, prefix='/TSAWARE')
