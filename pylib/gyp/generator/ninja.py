@@ -97,6 +97,12 @@ def Define(d, flavor):
   return QuoteShellArgument(ninja_syntax.escape('-D' + d), flavor)
 
 
+def AddArch(output, arch):
+  """Adds an arch string to an output path."""
+  output, extension = os.path.splitext(output)
+  return '%s.%s%s' % (output, arch, extension)
+
+
 class Target:
   """Target represents the paths used within a single gyp target.
 
@@ -203,7 +209,8 @@ class Target:
 
 class NinjaWriter:
   def __init__(self, qualified_target, target_outputs, base_dir, build_dir,
-               output_file, flavor, toplevel_dir=None):
+               output_file, toplevel_build, output_file_name, flavor,
+               toplevel_dir=None):
     """
     base_dir: path from source root to directory containing this gyp file,
               by gyp semantics, all input paths are relative to this
@@ -216,6 +223,9 @@ class NinjaWriter:
     self.base_dir = base_dir
     self.build_dir = build_dir
     self.ninja = ninja_syntax.Writer(output_file)
+    self.toplevel_build = toplevel_build
+    self.output_file_name = output_file_name
+
     self.flavor = flavor
     self.abs_build_dir = None
     if toplevel_dir is not None:
@@ -345,6 +355,10 @@ class NinjaWriter:
       self.ninja.newline()
     return targets[0]
 
+  def _SubninjaNameForArch(self, arch):
+    output_file_base = os.path.splitext(self.output_file_name)[0]
+    return '%s.%s.ninja' % (output_file_base, arch)
+
   def WriteSpec(self, spec, config_name, generator_flags,
       case_sensitive_filesystem):
     """The main entry point for NinjaWriter: write the build rules for a spec.
@@ -372,6 +386,16 @@ class NinjaWriter:
       self.ninja.variable('arch', self.win_env[arch])
       self.ninja.variable('cc', '$cl_' + arch)
       self.ninja.variable('cxx', '$cl_' + arch)
+
+    if self.flavor == 'mac':
+      self.archs = self.xcode_settings.GetActiveArchs(config_name)
+      if len(self.archs) > 1:
+        self.arch_subninjas = dict(
+            (arch, ninja_syntax.Writer(
+                open(os.path.join(self.toplevel_build,
+                                  self._SubninjaNameForArch(arch)),
+                     'w')))
+            for arch in self.archs)
 
     # Compute predepends for all rules.
     # actions_depends is the dependencies this target depends on before running
@@ -415,6 +439,12 @@ class NinjaWriter:
     link_deps = []
     sources = spec.get('sources', []) + extra_sources
     if sources:
+      if self.flavor == 'mac' and len(self.archs) > 1:
+        # Write subninja file containing compile and link commands scoped to
+        # a single arch if a fat binary is being built.
+        for arch in self.archs:
+          self.ninja.subninja(self._SubninjaNameForArch(arch))
+
       pch = None
       if self.flavor == 'win':
         gyp.msvs_emulation.VerifyMissingSources(
@@ -427,11 +457,17 @@ class NinjaWriter:
             self.xcode_settings, self.GypPathToNinja,
             lambda path, lang: self.GypPathToUniqueOutput(path + '-' + lang))
       link_deps = self.WriteSources(
-          config_name, config, sources, compile_depends_stamp, pch,
+          self.ninja, config_name, config, sources, compile_depends_stamp, pch,
           case_sensitive_filesystem, spec)
       # Some actions/rules output 'sources' that are already object files.
-      link_deps += [self.GypPathToNinja(f)
-          for f in sources if f.endswith(self.obj_ext)]
+      obj_outputs = [f for f in sources if f.endswith(self.obj_ext)]
+      if obj_outputs:
+        if self.flavor != 'mac' or len(self.archs) == 1:
+          link_deps += [self.GypPathToNinja(o) for o in obj_outputs]
+        else:
+          print "Warning: Actions/rules writing object files don't work with " \
+                "multiarch targets, dropping. (target %s)" % spec['target_name']
+
 
     if self.flavor == 'win' and self.target.type == 'static_library':
       self.target.component_objs = link_deps
@@ -720,7 +756,7 @@ class NinjaWriter:
                                 ('env', env)])
     bundle_depends.append(out)
 
-  def WriteSources(self, config_name, config, sources, predepends,
+  def WriteSources(self, ninja_file, config_name, config, sources, predepends,
                    precompiled_header, case_sensitive_filesystem, spec):
     """Write build rules to compile all of |sources|."""
     if self.toolset == 'host':
@@ -729,9 +765,24 @@ class NinjaWriter:
       self.ninja.variable('cxx', '$cxx_host')
       self.ninja.variable('ld', '$ld_host')
 
+    if self.flavor != 'mac' or len(self.archs) == 1:
+      return self.WriteSourcesForArch(
+          self.ninja, config_name, config, sources, predepends,
+          precompiled_header, case_sensitive_filesystem, spec)
+    else:
+      return dict((arch, self.WriteSourcesForArch(
+            self.arch_subninjas[arch], config_name, config, sources, predepends,
+            precompiled_header, case_sensitive_filesystem, spec, arch=arch))
+          for arch in self.archs)
+
+  def WriteSourcesForArch(self, ninja_file, config_name, config, sources,
+                          predepends, precompiled_header,
+                          case_sensitive_filesystem, spec, arch=None):
+    """Write build rules to compile all of |sources|."""
+
     extra_defines = []
     if self.flavor == 'mac':
-      cflags = self.xcode_settings.GetCflags(config_name)
+      cflags = self.xcode_settings.GetCflags(config_name, arch=arch)
       cflags_c = self.xcode_settings.GetCflagsC(config_name)
       cflags_cc = self.xcode_settings.GetCflagsCC(config_name)
       cflags_objc = ['$cflags_c'] + \
@@ -751,17 +802,25 @@ class NinjaWriter:
           obj += '.' + self.toolset
         pdbpath = os.path.normpath(os.path.join(obj, self.base_dir,
                                                 self.name + '.pdb'))
-      self.WriteVariableList('pdbname', [pdbpath])
-      self.WriteVariableList('pchprefix', [self.name])
+      self.WriteVariableList(ninja_file, 'pdbname', [pdbpath])
+      self.WriteVariableList(ninja_file, 'pchprefix', [self.name])
     else:
       cflags = config.get('cflags', [])
-      cflags_c = config.get('cflags_c', [])
-      cflags_cc = config.get('cflags_cc', [])
+
+      # Respect environment variables related to build, but target-specific
+      # flags can still override them.
+      cflags_c = (os.environ.get('CPPFLAGS', '').split() +
+                  os.environ.get('CFLAGS', '').split() +
+                  config.get('cflags_c', []))
+      cflags_cc = (os.environ.get('CPPFLAGS', '').split() +
+                   os.environ.get('CXXFLAGS', '').split() +
+                   config.get('cflags_cc', []))
 
     defines = config.get('defines', []) + extra_defines
-    self.WriteVariableList('defines', [Define(d, self.flavor) for d in defines])
+    self.WriteVariableList(ninja_file, 'defines',
+                           [Define(d, self.flavor) for d in defines])
     if self.flavor == 'win':
-      self.WriteVariableList('rcflags',
+      self.WriteVariableList(ninja_file, 'rcflags',
           [QuoteShellArgument(self.ExpandSpecial(f), self.flavor)
            for f in self.msvs_settings.GetRcflags(config_name,
                                                   self.GypPathToNinja)])
@@ -771,27 +830,30 @@ class NinjaWriter:
       include_dirs = self.msvs_settings.AdjustIncludeDirs(include_dirs,
                                                           config_name)
     env = self.GetSortedXcodeEnv()
-    self.WriteVariableList('includes',
+    self.WriteVariableList(ninja_file, 'includes',
         [QuoteShellArgument('-I' + self.GypPathToNinja(i, env), self.flavor)
          for i in include_dirs])
 
-    pch_commands = precompiled_header.GetPchBuildCommands()
+    pch_commands = precompiled_header.GetPchBuildCommands(arch)
     if self.flavor == 'mac':
       # Most targets use no precompiled headers, so only write these if needed.
       for ext, var in [('c', 'cflags_pch_c'), ('cc', 'cflags_pch_cc'),
                        ('m', 'cflags_pch_objc'), ('mm', 'cflags_pch_objcc')]:
-        include = precompiled_header.GetInclude(ext)
-        if include: self.ninja.variable(var, include)
+        include = precompiled_header.GetInclude(ext, arch)
+        if include: ninja_file.variable(var, include)
 
-    self.WriteVariableList('cflags', map(self.ExpandSpecial, cflags))
-    self.WriteVariableList('cflags_c', map(self.ExpandSpecial, cflags_c))
-    self.WriteVariableList('cflags_cc', map(self.ExpandSpecial, cflags_cc))
+    self.WriteVariableList(ninja_file, 'cflags',
+                           map(self.ExpandSpecial, cflags))
+    self.WriteVariableList(ninja_file, 'cflags_c',
+                           map(self.ExpandSpecial, cflags_c))
+    self.WriteVariableList(ninja_file, 'cflags_cc',
+                           map(self.ExpandSpecial, cflags_cc))
     if self.flavor == 'mac':
-      self.WriteVariableList('cflags_objc', map(self.ExpandSpecial,
-                                                cflags_objc))
-      self.WriteVariableList('cflags_objcc', map(self.ExpandSpecial,
-                                                 cflags_objcc))
-    self.ninja.newline()
+      self.WriteVariableList(ninja_file, 'cflags_objc',
+                             map(self.ExpandSpecial, cflags_objc))
+      self.WriteVariableList(ninja_file, 'cflags_objcc',
+                             map(self.ExpandSpecial, cflags_objcc))
+    ninja_file.newline()
     outputs = []
     for source in sources:
       filename, ext = os.path.splitext(source)
@@ -823,29 +885,31 @@ class NinjaWriter:
         continue
       input = self.GypPathToNinja(source)
       output = self.GypPathToUniqueOutput(filename + obj_ext)
+      if arch is not None:
+        output = AddArch(output, arch)
       # Ninja's depfile handling gets confused when the case of a filename
       # changes on a case-insensitive file system. To work around that, always
       # convert .o filenames to lowercase on such file systems. See
       # https://github.com/martine/ninja/issues/402 for details.
       if not case_sensitive_filesystem:
         output = output.lower()
-      implicit = precompiled_header.GetObjDependencies([input], [output])
+      implicit = precompiled_header.GetObjDependencies([input], [output], arch)
       variables = []
       if self.flavor == 'win':
         variables, output, implicit = precompiled_header.GetFlagsModifications(
             input, output, implicit, command, cflags_c, cflags_cc,
             self.ExpandSpecial)
-      self.ninja.build(output, command, input,
+      ninja_file.build(output, command, input,
                        implicit=[gch for _, _, gch in implicit],
                        order_only=predepends, variables=variables)
       outputs.append(output)
 
-    self.WritePchTargets(pch_commands)
+    self.WritePchTargets(ninja_file, pch_commands)
 
-    self.ninja.newline()
+    ninja_file.newline()
     return outputs
 
-  def WritePchTargets(self, pch_commands):
+  def WritePchTargets(self, ninja_file, pch_commands):
     """Writes ninja rules to compile prefix headers."""
     if not pch_commands:
       return
@@ -860,11 +924,28 @@ class NinjaWriter:
 
       map = { 'c': 'cc', 'cc': 'cxx', 'm': 'objc', 'mm': 'objcxx', }
       cmd = map.get(lang)
-      self.ninja.build(gch, cmd, input, variables=[(var_name, lang_flag)])
+      ninja_file.build(gch, cmd, input, variables=[(var_name, lang_flag)])
 
   def WriteLink(self, spec, config_name, config, link_deps):
     """Write out a link step. Fills out target.binary. """
+    if self.flavor != 'mac' or len(self.archs) == 1:
+      return self.WriteLinkForArch(
+          self.ninja, spec, config_name, config, link_deps)
+    else:
+      output = self.ComputeOutput(spec)
+      inputs = [self.WriteLinkForArch(self.arch_subninjas[arch], spec,
+                                      config_name, config, link_deps[arch],
+                                      arch=arch)
+                for arch in self.archs]
+      extra_bindings = []
+      if not self.is_mac_bundle:
+        self.AppendPostbuildVariable(extra_bindings, spec, output, output)
+      self.ninja.build(output, 'lipo', inputs, variables=extra_bindings)
+      return output
 
+  def WriteLinkForArch(self, ninja_file, spec, config_name, config,
+                       link_deps, arch=None):
+    """Write out a link step. Fills out target.binary. """
     command = {
       'executable':      'link',
       'loadable_module': 'solink_module',
@@ -906,24 +987,21 @@ class NinjaWriter:
       link_deps.extend(list(extra_link_deps))
 
     extra_bindings = []
-    if self.is_mac_bundle:
-      output = self.ComputeMacBundleBinaryOutput()
-    else:
-      output = self.ComputeOutput(spec)
-      extra_bindings.append(('postbuilds',
-                             self.GetPostbuildCommand(spec, output, output)))
+    output = self.ComputeOutput(spec, arch)
+    if arch is None and not self.is_mac_bundle:
+      self.AppendPostbuildVariable(extra_bindings, spec, output, output)
 
     is_executable = spec['type'] == 'executable'
     if self.flavor == 'mac':
       ldflags = self.xcode_settings.GetLdflags(config_name,
           self.ExpandSpecial(generator_default_variables['PRODUCT_DIR']),
-          self.GypPathToNinja)
+          self.GypPathToNinja, arch)
     elif self.flavor == 'win':
       manifest_name = self.GypPathToUniqueOutput(
           self.ComputeOutputFileName(spec))
       ldflags, manifest_files = self.msvs_settings.GetLdflags(config_name,
           self.GypPathToNinja, self.ExpandSpecial, manifest_name, is_executable)
-      self.WriteVariableList('manifests', manifest_files)
+      self.WriteVariableList(ninja_file, 'manifests', manifest_files)
       command_suffix = _GetWinLinkRuleNameSuffix(
           self.msvs_settings.IsEmbedManifest(config_name),
           self.msvs_settings.IsLinkIncremental(config_name))
@@ -931,16 +1009,18 @@ class NinjaWriter:
       if def_file:
         implicit_deps.add(def_file)
     else:
-      ldflags = config.get('ldflags', [])
+      # Respect environment variables related to build, but target-specific
+      # flags can still override them.
+      ldflags = (os.environ.get('LDFLAGS', '').split() +
+                 config.get('ldflags', []))
       if is_executable and len(solibs):
         rpath = 'lib/'
         if self.toolset != 'target':
           rpath += self.toolset
         ldflags.append('-Wl,-rpath=\$$ORIGIN/%s' % rpath)
         ldflags.append('-Wl,-rpath-link=%s' % rpath)
-    self.WriteVariableList('ldflags',
-                           gyp.common.uniquer(map(self.ExpandSpecial,
-                                                  ldflags)))
+    self.WriteVariableList(ninja_file, 'ldflags',
+                           gyp.common.uniquer(map(self.ExpandSpecial, ldflags)))
 
     library_dirs = config.get('library_dirs', [])
     if self.flavor == 'win':
@@ -961,9 +1041,9 @@ class NinjaWriter:
     elif self.flavor == 'win':
       libraries = self.msvs_settings.AdjustLibraries(libraries)
 
-    self.WriteVariableList('libs', library_dirs + libraries)
+    self.WriteVariableList(ninja_file, 'libs', library_dirs + libraries)
 
-    self.target.binary = output
+    linked_binary = output
 
     if command in ('solink', 'solink_module'):
       extra_bindings.append(('soname', os.path.split(output)[1]))
@@ -982,9 +1062,10 @@ class NinjaWriter:
     if len(solibs):
       extra_bindings.append(('solibs', gyp.common.EncodePOSIXShellList(solibs)))
 
-    self.ninja.build(output, command + command_suffix, link_deps,
+    ninja_file.build(output, command + command_suffix, link_deps,
                      implicit=list(implicit_deps),
                      variables=extra_bindings)
+    return linked_binary
 
   def WriteTarget(self, spec, config_name, config, link_deps, compile_deps):
     if spec['type'] == 'none':
@@ -993,39 +1074,53 @@ class NinjaWriter:
       self.target.binary = compile_deps
     elif spec['type'] == 'static_library':
       self.target.binary = self.ComputeOutput(spec)
-      variables = []
-      postbuild = self.GetPostbuildCommand(
-          spec, self.target.binary, self.target.binary)
-      if postbuild:
-        variables.append(('postbuilds', postbuild))
-      if self.xcode_settings:
-        libtool_flags = self.xcode_settings.GetLibtoolflags(config_name)
-        if libtool_flags:
-          variables.append(('libtool_flags', libtool_flags))
       if (self.flavor not in ('mac', 'openbsd', 'win') and not
           self.is_standalone_static_library):
         self.ninja.build(self.target.binary, 'alink_thin', link_deps,
-                         order_only=compile_deps, variables=variables)
+                         order_only=compile_deps)
       else:
+        variables = []
+        if self.xcode_settings:
+          libtool_flags = self.xcode_settings.GetLibtoolflags(config_name)
+          if libtool_flags:
+            variables.append(('libtool_flags', libtool_flags))
         if self.msvs_settings:
           libflags = self.msvs_settings.GetLibFlags(config_name,
                                                     self.GypPathToNinja)
           variables.append(('libflags', libflags))
-        self.ninja.build(self.target.binary, 'alink', link_deps,
-                         order_only=compile_deps, variables=variables)
+
+        if self.flavor != 'mac' or len(self.archs) == 1:
+          self.AppendPostbuildVariable(variables, spec,
+                                       self.target.binary, self.target.binary)
+          self.ninja.build(self.target.binary, 'alink', link_deps,
+                           order_only=compile_deps, variables=variables)
+        else:
+          inputs = []
+          for arch in self.archs:
+            output = self.ComputeOutput(spec, arch)
+            self.arch_subninjas[arch].build(output, 'alink', link_deps[arch],
+                                            order_only=compile_deps,
+                                            variables=variables)
+            inputs.append(output)
+          # TODO: It's not clear if libtool_flags should be passed to the alink
+          # call that combines single-arch .a files into a fat .a file.
+          self.AppendPostbuildVariable(variables, spec,
+                                       self.target.binary, self.target.binary)
+          self.ninja.build(self.target.binary, 'alink', inputs,
+                           # FIXME: test proving order_only=compile_deps isn't
+                           # needed.
+                           variables=variables)
     else:
-      self.WriteLink(spec, config_name, config, link_deps)
+      self.target.binary = self.WriteLink(spec, config_name, config, link_deps)
     return self.target.binary
 
   def WriteMacBundle(self, spec, mac_bundle_depends):
     assert self.is_mac_bundle
     package_framework = spec['type'] in ('shared_library', 'loadable_module')
     output = self.ComputeMacBundleOutput()
-    postbuild = self.GetPostbuildCommand(spec, output, self.target.binary,
-                                         is_command_start=not package_framework)
     variables = []
-    if postbuild:
-      variables.append(('postbuilds', postbuild))
+    self.AppendPostbuildVariable(variables, spec, output, self.target.binary,
+                                 is_command_start=not package_framework)
     if package_framework:
       variables.append(('version', self.xcode_settings.GetFrameworkVersion()))
       self.ninja.build(output, 'package_framework', mac_bundle_depends,
@@ -1056,8 +1151,14 @@ class NinjaWriter:
       postbuild_settings['CHROMIUM_STRIP_SAVE_FILE'] = strip_save_file
     return self.GetSortedXcodeEnv(additional_settings=postbuild_settings)
 
-  def GetPostbuildCommand(self, spec, output, output_binary,
-                          is_command_start=False):
+  def AppendPostbuildVariable(self, variables, spec, output, binary,
+                              is_command_start=False):
+    """Adds a 'postbuild' variable if there is a postbuild for |output|."""
+    postbuild = self.GetPostbuildCommand(spec, output, binary, is_command_start)
+    if postbuild:
+      variables.append(('postbuilds', postbuild))
+
+  def GetPostbuildCommand(self, spec, output, output_binary, is_command_start):
     """Returns a shell command that runs all the postbuilds, and removes
     |output| if any of them fails. If |is_command_start| is False, then the
     returned string will start with ' && '."""
@@ -1111,13 +1212,6 @@ class NinjaWriter:
     return self.ExpandSpecial(
         os.path.join(path, self.xcode_settings.GetWrapperName()))
 
-  def ComputeMacBundleBinaryOutput(self):
-    """Return the 'output' (full output path) to the binary in a bundle."""
-    assert self.is_mac_bundle
-    path = generator_default_variables['PRODUCT_DIR']
-    return self.ExpandSpecial(
-        os.path.join(path, self.xcode_settings.GetExecutablePath()))
-
   def ComputeOutputFileName(self, spec, type=None):
     """Compute the filename of the final output for the current target."""
     if not type:
@@ -1168,12 +1262,9 @@ class NinjaWriter:
     else:
       raise Exception('Unhandled output type %s' % type)
 
-  def ComputeOutput(self, spec, type=None):
+  def ComputeOutput(self, spec, arch=None):
     """Compute the path for the final output of the spec."""
-    assert not self.is_mac_bundle or type
-
-    if not type:
-      type = spec['type']
+    type = spec['type']
 
     if self.flavor == 'win':
       override = self.msvs_settings.GetOutputName(self.config_name,
@@ -1181,13 +1272,13 @@ class NinjaWriter:
       if override:
         return override
 
-    if self.flavor == 'mac' and type in (
+    if arch is None and self.flavor == 'mac' and type in (
         'static_library', 'executable', 'shared_library', 'loadable_module'):
       filename = self.xcode_settings.GetExecutablePath()
     else:
       filename = self.ComputeOutputFileName(spec, type)
 
-    if 'product_dir' in spec:
+    if arch is None and 'product_dir' in spec:
       path = os.path.join(spec['product_dir'], filename)
       return self.ExpandSpecial(path)
 
@@ -1199,7 +1290,14 @@ class NinjaWriter:
     elif self.flavor == 'win' and self.toolset == 'target':
       type_in_output_root += ['shared_library']
 
-    if type in type_in_output_root or self.is_standalone_static_library:
+    if arch is not None:
+      # Make sure partial executables don't end up in a bundle or the regular
+      # output directory.
+      archdir = 'arch'
+      if self.toolset != 'target':
+        archdir = os.path.join('arch', '%s' % self.toolset)
+      return os.path.join(archdir, AddArch(filename, arch))
+    elif type in type_in_output_root or self.is_standalone_static_library:
       return filename
     elif type == 'shared_library':
       libdir = 'lib'
@@ -1209,11 +1307,11 @@ class NinjaWriter:
     else:
       return self.GypPathToUniqueOutput(filename, qualified=False)
 
-  def WriteVariableList(self, var, values):
+  def WriteVariableList(self, ninja_file, var, values):
     assert not isinstance(values, str)
     if values is None:
       values = []
-    self.ninja.variable(var, ' '.join(values))
+    ninja_file.variable(var, ' '.join(values))
 
   def WriteNewNinjaRule(self, name, args, description, is_cygwin, env):
     """Write out a new ninja "rule" statement for a given command.
@@ -1759,6 +1857,10 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
               './gyp-mac-tool filter-libtool libtool $libtool_flags '
               '-static -o $out $in'
               '$postbuilds')
+    master_ninja.rule(
+      'lipo',
+      description='LIPO $out, POSTBUILDS',
+      command='rm -f $out && lipo -create $in -output $out$postbuilds')
 
     # Record the public interface of $lib in $lib.TOC. See the corresponding
     # comment in the posix section above for details.
@@ -1873,6 +1975,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
 
     writer = NinjaWriter(qualified_target, target_outputs, base_path, build_dir,
                          OpenOutput(os.path.join(toplevel_build, output_file)),
+                         toplevel_build, output_file,
                          flavor, toplevel_dir=options.toplevel_dir)
     master_ninja.subninja(output_file)
 
