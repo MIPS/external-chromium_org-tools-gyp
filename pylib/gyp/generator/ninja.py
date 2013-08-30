@@ -1057,8 +1057,10 @@ class NinjaWriter:
           extra_bindings.append(('implibflag',
                                  '/IMPLIB:%s' % self.target.import_lib))
           output = [output, self.target.import_lib]
-      else:
+      elif not self.is_mac_bundle:
         output = [output, output + '.TOC']
+      else:
+        command = command + '_notoc'
 
     if len(solibs):
       extra_bindings.append(('solibs', gyp.common.EncodePOSIXShellList(solibs)))
@@ -1483,6 +1485,24 @@ def GetDefaultConcurrentLinks():
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
 
     return max(1, stat.ullTotalPhys / (4 * (2 ** 30)))  # total / 4GB
+  elif sys.platform.startswith('linux'):
+    with open("/proc/meminfo") as meminfo:
+      memtotal_re = re.compile(r'^MemTotal:\s*(\d*)\s*kB')
+      for line in meminfo:
+        match = memtotal_re.match(line)
+        if not match:
+          continue
+        # Allow 8Gb per link on Linux because Gold is quite memory hungry
+        return max(1, int(match.group(1)) / (8 * (2 ** 20)))
+    return 1
+  elif sys.platform == 'darwin':
+    try:
+      avail_bytes = int(subprocess.check_output(['sysctl', '-n', 'hw.memsize']))
+      # A static library debug build of Chromium's unit_tests takes ~2.7GB, so
+      # 4GB per ld process allows for some more bloat.
+      return max(1, avail_bytes / (4 * (2 ** 30)))  # total / 4GB
+    except:
+      return 1
   else:
     # TODO(scottmg): Implement this for other platforms.
     return 1
@@ -1865,6 +1885,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
 
     # Record the public interface of $lib in $lib.TOC. See the corresponding
     # comment in the posix section above for details.
+    solink_base = '$ld -shared $ldflags -o $lib %(suffix)s'
     mtime_preserving_solink_base = (
         'if [ ! -e $lib -o ! -e ${lib}.TOC ] || '
              # Always force dependent targets to relink if this library
@@ -1878,26 +1899,39 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
             'mv ${lib}.tmp ${lib}.TOC ; '
           'fi; '
         'fi'
-        % { 'solink': '$ld -shared $ldflags -o $lib %(suffix)s',
+        % { 'solink': solink_base,
             'extract_toc':
               '{ otool -l $lib | grep LC_ID_DYLIB -A 5; '
               'nm -gP $lib | cut -f1-2 -d\' \' | grep -v U$$; true; }'})
 
     # TODO(thakis): The solink_module rule is likely wrong. Xcode seems to pass
     # -bundle -single_module here (for osmesa.so).
+    solink_suffix = '$in $solibs $libs$postbuilds'
     master_ninja.rule(
       'solink',
       description='SOLINK $lib, POSTBUILDS',
       restat=True,
-      command=(mtime_preserving_solink_base % {
-          'suffix': '$in $solibs $libs$postbuilds'}),
+      command=mtime_preserving_solink_base % {'suffix':solink_suffix},
       pool='link_pool')
+    master_ninja.rule(
+      'solink_notoc',
+      description='SOLINK $lib, POSTBUILDS',
+      restat=True,
+      command=solink_base % {'suffix':solink_suffix},
+      pool='link_pool')
+
+    solink_module_suffix = '$in $solibs $libs$postbuilds'
     master_ninja.rule(
       'solink_module',
       description='SOLINK(module) $lib, POSTBUILDS',
       restat=True,
-      command=(mtime_preserving_solink_base % {
-          'suffix': '$in $solibs $libs$postbuilds'}),
+      command=mtime_preserving_solink_base % {'suffix':solink_module_suffix},
+      pool='link_pool')
+    master_ninja.rule(
+      'solink_module_notoc',
+      description='SOLINK(module) $lib, POSTBUILDS',
+      restat=True,
+      command=solink_base % {'suffix':solink_module_suffix},
       pool='link_pool')
 
     master_ninja.rule(
