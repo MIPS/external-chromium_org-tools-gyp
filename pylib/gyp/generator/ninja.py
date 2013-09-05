@@ -359,8 +359,7 @@ class NinjaWriter:
     output_file_base = os.path.splitext(self.output_file_name)[0]
     return '%s.%s.ninja' % (output_file_base, arch)
 
-  def WriteSpec(self, spec, config_name, generator_flags,
-      case_sensitive_filesystem):
+  def WriteSpec(self, spec, config_name, generator_flags):
     """The main entry point for NinjaWriter: write the build rules for a spec.
 
     Returns a Target object, which represents the output paths for this spec.
@@ -458,7 +457,7 @@ class NinjaWriter:
             lambda path, lang: self.GypPathToUniqueOutput(path + '-' + lang))
       link_deps = self.WriteSources(
           self.ninja, config_name, config, sources, compile_depends_stamp, pch,
-          case_sensitive_filesystem, spec)
+          spec)
       # Some actions/rules output 'sources' that are already object files.
       obj_outputs = [f for f in sources if f.endswith(self.obj_ext)]
       if obj_outputs:
@@ -531,6 +530,10 @@ class NinjaWriter:
     """Write out the Actions, Rules, and Copies steps.  Return a path
     representing the outputs of these steps."""
     outputs = []
+    if self.is_mac_bundle:
+      mac_bundle_resources = spec.get('mac_bundle_resources', [])[:]
+    else:
+      mac_bundle_resources = []
     extra_mac_bundle_resources = []
 
     if 'actions' in spec:
@@ -538,6 +541,7 @@ class NinjaWriter:
                                    extra_mac_bundle_resources)
     if 'rules' in spec:
       outputs += self.WriteRules(spec['rules'], extra_sources, prebuild,
+                                 mac_bundle_resources,
                                  extra_mac_bundle_resources)
     if 'copies' in spec:
       outputs += self.WriteCopies(spec['copies'], prebuild, mac_bundle_depends)
@@ -548,9 +552,8 @@ class NinjaWriter:
     stamp = self.WriteCollapsedDependencies('actions_rules_copies', outputs)
 
     if self.is_mac_bundle:
-      mac_bundle_resources = spec.get('mac_bundle_resources', []) + \
-                             extra_mac_bundle_resources
-      self.WriteMacBundleResources(mac_bundle_resources, mac_bundle_depends)
+      self.WriteMacBundleResources(
+          mac_bundle_resources + extra_mac_bundle_resources, mac_bundle_depends)
       self.WriteMacInfoPlist(mac_bundle_depends)
 
     return stamp
@@ -607,7 +610,7 @@ class NinjaWriter:
     return all_outputs
 
   def WriteRules(self, rules, extra_sources, prebuild,
-                 extra_mac_bundle_resources):
+                 mac_bundle_resources, extra_mac_bundle_resources):
     env = self.GetSortedXcodeEnv()
     all_outputs = []
     for rule in rules:
@@ -661,8 +664,16 @@ class NinjaWriter:
 
         if int(rule.get('process_outputs_as_sources', False)):
           extra_sources += outputs
-        if int(rule.get('process_outputs_as_mac_bundle_resources', False)):
+
+        was_mac_bundle_resource = source in mac_bundle_resources
+        if was_mac_bundle_resource or \
+            int(rule.get('process_outputs_as_mac_bundle_resources', False)):
           extra_mac_bundle_resources += outputs
+          # Note: This is n_resources * n_outputs_in_rule.  Put to-be-removed
+          # items in a set and remove them all in a single pass if this becomes
+          # a performance issue.
+          if was_mac_bundle_resource:
+            mac_bundle_resources.remove(source)
 
         extra_bindings = []
         for var in needed_variables:
@@ -759,7 +770,7 @@ class NinjaWriter:
     bundle_depends.append(out)
 
   def WriteSources(self, ninja_file, config_name, config, sources, predepends,
-                   precompiled_header, case_sensitive_filesystem, spec):
+                   precompiled_header, spec):
     """Write build rules to compile all of |sources|."""
     if self.toolset == 'host':
       self.ninja.variable('ar', '$ar_host')
@@ -770,16 +781,15 @@ class NinjaWriter:
     if self.flavor != 'mac' or len(self.archs) == 1:
       return self.WriteSourcesForArch(
           self.ninja, config_name, config, sources, predepends,
-          precompiled_header, case_sensitive_filesystem, spec)
+          precompiled_header, spec)
     else:
       return dict((arch, self.WriteSourcesForArch(
             self.arch_subninjas[arch], config_name, config, sources, predepends,
-            precompiled_header, case_sensitive_filesystem, spec, arch=arch))
+            precompiled_header, spec, arch=arch))
           for arch in self.archs)
 
   def WriteSourcesForArch(self, ninja_file, config_name, config, sources,
-                          predepends, precompiled_header,
-                          case_sensitive_filesystem, spec, arch=None):
+                          predepends, precompiled_header, spec, arch=None):
     """Write build rules to compile all of |sources|."""
 
     extra_defines = []
@@ -890,12 +900,6 @@ class NinjaWriter:
       output = self.GypPathToUniqueOutput(filename + obj_ext)
       if arch is not None:
         output = AddArch(output, arch)
-      # Ninja's depfile handling gets confused when the case of a filename
-      # changes on a case-insensitive file system. To work around that, always
-      # convert .o filenames to lowercase on such file systems. See
-      # https://github.com/martine/ninja/issues/402 for details.
-      if not case_sensitive_filesystem:
-        output = output.lower()
       implicit = precompiled_header.GetObjDependencies([input], [output], arch)
       variables = []
       if self.flavor == 'win':
@@ -1616,8 +1620,6 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   master_ninja = ninja_syntax.Writer(
       OpenOutput(os.path.join(toplevel_build, 'build.ninja')),
       width=120)
-  case_sensitive_filesystem = not os.path.exists(
-      os.path.join(toplevel_build, 'BUILD.NINJA'))
 
   # Put build-time support tools in out/{config_name}.
   gyp.common.CopyTool(flavor, toplevel_build)
@@ -2022,8 +2024,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
                          flavor, toplevel_dir=options.toplevel_dir)
     master_ninja.subninja(output_file)
 
-    target = writer.WriteSpec(
-        spec, config_name, generator_flags, case_sensitive_filesystem)
+    target = writer.WriteSpec(spec, config_name, generator_flags)
     if target:
       if name != target.FinalOutput() and spec['toolset'] == 'target':
         target_short_names.setdefault(name, []).append(target)
