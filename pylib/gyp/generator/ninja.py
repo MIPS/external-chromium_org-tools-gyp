@@ -211,7 +211,7 @@ class Target:
 class NinjaWriter:
   def __init__(self, qualified_target, target_outputs, base_dir, build_dir,
                output_file, toplevel_build, output_file_name, flavor,
-               toplevel_dir=None):
+               deps_file=None, toplevel_dir=None):
     """
     base_dir: path from source root to directory containing this gyp file,
               by gyp semantics, all input paths are relative to this
@@ -245,6 +245,7 @@ class NinjaWriter:
     # Relative path from base dir to build dir.
     base_to_top = gyp.common.InvertRelativePath(base_dir, toplevel_dir)
     self.base_to_build = os.path.join(base_to_top, build_dir)
+    self.link_deps_file = deps_file
 
   def ExpandSpecial(self, path, product_dir=None):
     """Expand specials like $!PRODUCT_DIR in |path|.
@@ -395,9 +396,9 @@ class NinjaWriter:
       if len(self.archs) > 1:
         self.arch_subninjas = dict(
             (arch, ninja_syntax.Writer(
-                open(os.path.join(self.toplevel_build,
-                                  self._SubninjaNameForArch(arch)),
-                     'w')))
+                OpenOutput(os.path.join(self.toplevel_build,
+                                        self._SubninjaNameForArch(arch)),
+                           'w')))
             for arch in self.archs)
 
     # Compute predepends for all rules.
@@ -982,6 +983,13 @@ class NinjaWriter:
           continue
         linkable = target.Linkable()
         if linkable:
+          if self.link_deps_file:
+            # Save the mapping of link deps.
+            self.link_deps_file.write(self.qualified_target)
+            self.link_deps_file.write(' ')
+            self.link_deps_file.write(target.binary)
+            self.link_deps_file.write('\n')
+
           if (self.flavor == 'win' and
               target.component_objs and
               self.msvs_settings.IsUseLibraryDependencyInputs(config_name)):
@@ -1506,7 +1514,13 @@ def GetDefaultConcurrentLinks():
     stat.dwLength = ctypes.sizeof(stat)
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
 
-    return max(1, stat.ullTotalPhys / (4 * (2 ** 30)))  # total / 4GB
+    mem_limit = max(1, stat.ullTotalPhys / (4 * (2 ** 30)))  # total / 4GB
+    cpu_limit = 1
+    try:
+      cpu_limit = multiprocessing.cpu_count()
+    except NotImplementedError:
+      pass
+    return min(mem_limit, cpu_limit)
   elif sys.platform.startswith('linux'):
     with open("/proc/meminfo") as meminfo:
       memtotal_re = re.compile(r'^MemTotal:\s*(\d*)\s*kB')
@@ -2006,6 +2020,14 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   # target_short_names is a map from target short name to a list of Target
   # objects.
   target_short_names = {}
+
+  # Extract the optional link deps file name.
+  LINK_DEPS_FILE = 'link_deps_file'
+  if LINK_DEPS_FILE in generator_flags:
+    link_deps_file = open(generator_flags.get(LINK_DEPS_FILE), 'wb')
+  else:
+    link_deps_file = None
+
   for qualified_target in target_list:
     # qualified_target is like: third_party/icu/icu.gyp:icui18n#target
     build_file, name, toolset = \
@@ -2031,7 +2053,9 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     writer = NinjaWriter(qualified_target, target_outputs, base_path, build_dir,
                          ninja_output,
                          toplevel_build, output_file,
-                         flavor, toplevel_dir=options.toplevel_dir)
+                         flavor, link_deps_file,
+                         toplevel_dir=options.toplevel_dir)
+
     target = writer.WriteSpec(spec, config_name, generator_flags)
 
     if ninja_output.tell() > 0:
