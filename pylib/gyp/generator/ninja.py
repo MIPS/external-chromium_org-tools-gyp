@@ -15,6 +15,7 @@ import gyp.common
 import gyp.msvs_emulation
 import gyp.MSVSUtil as MSVSUtil
 import gyp.xcode_emulation
+from cStringIO import StringIO
 
 from gyp.common import GetEnvironFallback
 import gyp.ninja_syntax as ninja_syntax
@@ -359,8 +360,7 @@ class NinjaWriter:
     output_file_base = os.path.splitext(self.output_file_name)[0]
     return '%s.%s.ninja' % (output_file_base, arch)
 
-  def WriteSpec(self, spec, config_name, generator_flags,
-      case_sensitive_filesystem):
+  def WriteSpec(self, spec, config_name, generator_flags):
     """The main entry point for NinjaWriter: write the build rules for a spec.
 
     Returns a Target object, which represents the output paths for this spec.
@@ -374,6 +374,9 @@ class NinjaWriter:
     self.target = Target(spec['type'])
     self.is_standalone_static_library = bool(
         spec.get('standalone_static_library', 0))
+    # Track if this target contains any C++ files, to decide if gcc or g++
+    # should be used for linking.
+    self.uses_cpp = False
 
     self.is_mac_bundle = gyp.xcode_emulation.IsMacBundle(self.flavor, spec)
     self.xcode_settings = self.msvs_settings = None
@@ -458,7 +461,7 @@ class NinjaWriter:
             lambda path, lang: self.GypPathToUniqueOutput(path + '-' + lang))
       link_deps = self.WriteSources(
           self.ninja, config_name, config, sources, compile_depends_stamp, pch,
-          case_sensitive_filesystem, spec)
+          spec)
       # Some actions/rules output 'sources' that are already object files.
       obj_outputs = [f for f in sources if f.endswith(self.obj_ext)]
       if obj_outputs:
@@ -474,15 +477,17 @@ class NinjaWriter:
 
     # Write out a link step, if needed.
     output = None
+    is_empty_bundle = True
     if link_deps or self.target.actions_stamp or actions_depends:
       output = self.WriteTarget(spec, config_name, config, link_deps,
                                 self.target.actions_stamp or actions_depends)
       if self.is_mac_bundle:
+        is_empty_bundle = not link_deps and not mac_bundle_depends
         mac_bundle_depends.append(output)
 
     # Bundle all of the above together, if needed.
     if self.is_mac_bundle:
-      output = self.WriteMacBundle(spec, mac_bundle_depends)
+      output = self.WriteMacBundle(spec, mac_bundle_depends, is_empty_bundle)
 
     if not output:
       return None
@@ -529,6 +534,10 @@ class NinjaWriter:
     """Write out the Actions, Rules, and Copies steps.  Return a path
     representing the outputs of these steps."""
     outputs = []
+    if self.is_mac_bundle:
+      mac_bundle_resources = spec.get('mac_bundle_resources', [])[:]
+    else:
+      mac_bundle_resources = []
     extra_mac_bundle_resources = []
 
     if 'actions' in spec:
@@ -536,6 +545,7 @@ class NinjaWriter:
                                    extra_mac_bundle_resources)
     if 'rules' in spec:
       outputs += self.WriteRules(spec['rules'], extra_sources, prebuild,
+                                 mac_bundle_resources,
                                  extra_mac_bundle_resources)
     if 'copies' in spec:
       outputs += self.WriteCopies(spec['copies'], prebuild, mac_bundle_depends)
@@ -546,9 +556,8 @@ class NinjaWriter:
     stamp = self.WriteCollapsedDependencies('actions_rules_copies', outputs)
 
     if self.is_mac_bundle:
-      mac_bundle_resources = spec.get('mac_bundle_resources', []) + \
-                             extra_mac_bundle_resources
-      self.WriteMacBundleResources(mac_bundle_resources, mac_bundle_depends)
+      self.WriteMacBundleResources(
+          mac_bundle_resources + extra_mac_bundle_resources, mac_bundle_depends)
       self.WriteMacInfoPlist(mac_bundle_depends)
 
     return stamp
@@ -605,7 +614,7 @@ class NinjaWriter:
     return all_outputs
 
   def WriteRules(self, rules, extra_sources, prebuild,
-                 extra_mac_bundle_resources):
+                 mac_bundle_resources, extra_mac_bundle_resources):
     env = self.GetSortedXcodeEnv()
     all_outputs = []
     for rule in rules:
@@ -659,8 +668,16 @@ class NinjaWriter:
 
         if int(rule.get('process_outputs_as_sources', False)):
           extra_sources += outputs
-        if int(rule.get('process_outputs_as_mac_bundle_resources', False)):
+
+        was_mac_bundle_resource = source in mac_bundle_resources
+        if was_mac_bundle_resource or \
+            int(rule.get('process_outputs_as_mac_bundle_resources', False)):
           extra_mac_bundle_resources += outputs
+          # Note: This is n_resources * n_outputs_in_rule.  Put to-be-removed
+          # items in a set and remove them all in a single pass if this becomes
+          # a performance issue.
+          if was_mac_bundle_resource:
+            mac_bundle_resources.remove(source)
 
         extra_bindings = []
         for var in needed_variables:
@@ -757,27 +774,27 @@ class NinjaWriter:
     bundle_depends.append(out)
 
   def WriteSources(self, ninja_file, config_name, config, sources, predepends,
-                   precompiled_header, case_sensitive_filesystem, spec):
+                   precompiled_header, spec):
     """Write build rules to compile all of |sources|."""
     if self.toolset == 'host':
       self.ninja.variable('ar', '$ar_host')
       self.ninja.variable('cc', '$cc_host')
       self.ninja.variable('cxx', '$cxx_host')
       self.ninja.variable('ld', '$ld_host')
+      self.ninja.variable('ldxx', '$ldxx_host')
 
     if self.flavor != 'mac' or len(self.archs) == 1:
       return self.WriteSourcesForArch(
           self.ninja, config_name, config, sources, predepends,
-          precompiled_header, case_sensitive_filesystem, spec)
+          precompiled_header, spec)
     else:
       return dict((arch, self.WriteSourcesForArch(
             self.arch_subninjas[arch], config_name, config, sources, predepends,
-            precompiled_header, case_sensitive_filesystem, spec, arch=arch))
+            precompiled_header, spec, arch=arch))
           for arch in self.archs)
 
   def WriteSourcesForArch(self, ninja_file, config_name, config, sources,
-                          predepends, precompiled_header,
-                          case_sensitive_filesystem, spec, arch=None):
+                          predepends, precompiled_header, spec, arch=None):
     """Write build rules to compile all of |sources|."""
 
     extra_defines = []
@@ -862,6 +879,7 @@ class NinjaWriter:
       obj_ext = self.obj_ext
       if ext in ('cc', 'cpp', 'cxx'):
         command = 'cxx'
+        self.uses_cpp = True
       elif ext == 'c' or (ext == 'S' and self.flavor != 'win'):
         command = 'cc'
       elif ext == 's' and self.flavor != 'win':  # Doesn't generate .o.d files.
@@ -878,6 +896,7 @@ class NinjaWriter:
         command = 'objc'
       elif self.flavor == 'mac' and ext == 'mm':
         command = 'objcxx'
+        self.uses_cpp = True
       elif self.flavor == 'win' and ext == 'rc':
         command = 'rc'
         obj_ext = '.res'
@@ -888,12 +907,6 @@ class NinjaWriter:
       output = self.GypPathToUniqueOutput(filename + obj_ext)
       if arch is not None:
         output = AddArch(output, arch)
-      # Ninja's depfile handling gets confused when the case of a filename
-      # changes on a case-insensitive file system. To work around that, always
-      # convert .o filenames to lowercase on such file systems. See
-      # https://github.com/martine/ninja/issues/402 for details.
-      if not case_sensitive_filesystem:
-        output = output.lower()
       implicit = precompiled_header.GetObjDependencies([input], [output], arch)
       variables = []
       if self.flavor == 'win':
@@ -988,6 +1001,9 @@ class NinjaWriter:
       link_deps.extend(list(extra_link_deps))
 
     extra_bindings = []
+    if self.uses_cpp and self.flavor != 'win':
+      extra_bindings.append(('ld', '$ldxx'))
+
     output = self.ComputeOutput(spec, arch)
     if arch is None and not self.is_mac_bundle:
       self.AppendPostbuildVariable(extra_bindings, spec, output, output)
@@ -1071,10 +1087,14 @@ class NinjaWriter:
     return linked_binary
 
   def WriteTarget(self, spec, config_name, config, link_deps, compile_deps):
-    if spec['type'] == 'none':
+    extra_link_deps = any(self.target_outputs.get(dep).Linkable()
+                          for dep in spec.get('dependencies', [])
+                          if dep in self.target_outputs)
+    if spec['type'] == 'none' or (not link_deps and not extra_link_deps):
       # TODO(evan): don't call this function for 'none' target types, as
       # it doesn't do anything, and we fake out a 'binary' with a stamp file.
       self.target.binary = compile_deps
+      self.target.type = 'none'
     elif spec['type'] == 'static_library':
       self.target.binary = self.ComputeOutput(spec)
       if (self.flavor not in ('mac', 'openbsd', 'win') and not
@@ -1117,14 +1137,16 @@ class NinjaWriter:
       self.target.binary = self.WriteLink(spec, config_name, config, link_deps)
     return self.target.binary
 
-  def WriteMacBundle(self, spec, mac_bundle_depends):
+  def WriteMacBundle(self, spec, mac_bundle_depends, is_empty):
     assert self.is_mac_bundle
     package_framework = spec['type'] in ('shared_library', 'loadable_module')
     output = self.ComputeMacBundleOutput()
+    if is_empty:
+      output += '.stamp'
     variables = []
     self.AppendPostbuildVariable(variables, spec, output, self.target.binary,
                                  is_command_start=not package_framework)
-    if package_framework:
+    if package_framework and not is_empty:
       variables.append(('version', self.xcode_settings.GetFrameworkVersion()))
       self.ninja.build(output, 'package_framework', mac_bundle_depends,
                        variables=variables)
@@ -1608,8 +1630,6 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   master_ninja = ninja_syntax.Writer(
       OpenOutput(os.path.join(toplevel_build, 'build.ninja')),
       width=120)
-  case_sensitive_filesystem = not os.path.exists(
-      os.path.join(toplevel_build, 'BUILD.NINJA'))
 
   # Put build-time support tools in out/{config_name}.
   gyp.common.CopyTool(flavor, toplevel_build)
@@ -1632,8 +1652,10 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   else:
     cc = 'gcc'
     cxx = 'g++'
-    ld = '$cxx'
-    ld_host = '$cxx_host'
+    ld = '$cc'
+    ldxx = '$cxx'
+    ld_host = '$cc_host'
+    ldxx_host = '$cxx_host'
 
   cc_host = None
   cxx_host = None
@@ -1650,16 +1672,12 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       cc = os.path.join(build_to_root, value)
     if key == 'CXX':
       cxx = os.path.join(build_to_root, value)
-    if key == 'LD':
-      ld = os.path.join(build_to_root, value)
     if key == 'CC.host':
       cc_host = os.path.join(build_to_root, value)
       cc_host_global_setting = value
     if key == 'CXX.host':
       cxx_host = os.path.join(build_to_root, value)
       cxx_host_global_setting = value
-    if key == 'LD.host':
-      ld_host = os.path.join(build_to_root, value)
     if key.endswith('_wrapper'):
       wrappers[key[:-len('_wrapper')]] = os.path.join(build_to_root, value)
 
@@ -1682,7 +1700,6 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   master_ninja.variable('cc', CommandWithWrapper('CC', wrappers, cc))
   cxx = GetEnvironFallback(['CXX_target', 'CXX'], cxx)
   master_ninja.variable('cxx', CommandWithWrapper('CXX', wrappers, cxx))
-  ld = GetEnvironFallback(['LD_target', 'LD'], ld)
 
   if flavor == 'win':
     master_ninja.variable('ld', ld)
@@ -1693,6 +1710,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.variable('mt', 'mt.exe')
   else:
     master_ninja.variable('ld', CommandWithWrapper('LINK', wrappers, ld))
+    master_ninja.variable('ldxx', CommandWithWrapper('LINK', wrappers, ldxx))
     master_ninja.variable('ar', GetEnvironFallback(['AR_target', 'AR'], 'ar'))
 
   if generator_supports_multiple_toolsets:
@@ -1704,7 +1722,6 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.variable('ar_host', GetEnvironFallback(['AR_host'], 'ar'))
     cc_host = GetEnvironFallback(['CC_host'], cc_host)
     cxx_host = GetEnvironFallback(['CXX_host'], cxx_host)
-    ld_host = GetEnvironFallback(['LD_host'], ld_host)
 
     # The environment variable could be used in 'make_global_settings', like
     # ['CC.host', '$(CC)'] or ['CXX.host', '$(CXX)'], transform them here.
@@ -1721,6 +1738,8 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     else:
       master_ninja.variable('ld_host', CommandWithWrapper(
           'LINK', wrappers, ld_host))
+      master_ninja.variable('ldxx_host', CommandWithWrapper(
+          'LINK', wrappers, ldxx_host))
 
   master_ninja.newline()
 
@@ -1885,7 +1904,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
 
     # Record the public interface of $lib in $lib.TOC. See the corresponding
     # comment in the posix section above for details.
-    solink_base = '$ld -shared $ldflags -o $lib %(suffix)s'
+    solink_base = '$ld %(type)s $ldflags -o $lib %(suffix)s'
     mtime_preserving_solink_base = (
         'if [ ! -e $lib -o ! -e ${lib}.TOC ] || '
              # Always force dependent targets to relink if this library
@@ -1904,20 +1923,19 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
               '{ otool -l $lib | grep LC_ID_DYLIB -A 5; '
               'nm -gP $lib | cut -f1-2 -d\' \' | grep -v U$$; true; }'})
 
-    # TODO(thakis): The solink_module rule is likely wrong. Xcode seems to pass
-    # -bundle -single_module here (for osmesa.so).
     solink_suffix = '$in $solibs $libs$postbuilds'
     master_ninja.rule(
       'solink',
       description='SOLINK $lib, POSTBUILDS',
       restat=True,
-      command=mtime_preserving_solink_base % {'suffix':solink_suffix},
+      command=mtime_preserving_solink_base % {'suffix': solink_suffix,
+                                              'type': '-shared'},
       pool='link_pool')
     master_ninja.rule(
       'solink_notoc',
       description='SOLINK $lib, POSTBUILDS',
       restat=True,
-      command=solink_base % {'suffix':solink_suffix},
+      command=solink_base % {'suffix':solink_suffix, 'type': '-shared'},
       pool='link_pool')
 
     solink_module_suffix = '$in $solibs $libs$postbuilds'
@@ -1925,13 +1943,14 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       'solink_module',
       description='SOLINK(module) $lib, POSTBUILDS',
       restat=True,
-      command=mtime_preserving_solink_base % {'suffix':solink_module_suffix},
+      command=mtime_preserving_solink_base % {'suffix': solink_module_suffix,
+                                              'type': '-bundle'},
       pool='link_pool')
     master_ninja.rule(
       'solink_module_notoc',
       description='SOLINK(module) $lib, POSTBUILDS',
       restat=True,
-      command=solink_base % {'suffix':solink_module_suffix},
+      command=solink_base % {'suffix': solink_module_suffix, 'type': '-bundle'},
       pool='link_pool')
 
     master_ninja.rule(
@@ -2008,14 +2027,20 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       obj += '.' + toolset
     output_file = os.path.join(obj, base_path, name + '.ninja')
 
+    ninja_output = StringIO()
     writer = NinjaWriter(qualified_target, target_outputs, base_path, build_dir,
-                         OpenOutput(os.path.join(toplevel_build, output_file)),
+                         ninja_output,
                          toplevel_build, output_file,
                          flavor, toplevel_dir=options.toplevel_dir)
-    master_ninja.subninja(output_file)
+    target = writer.WriteSpec(spec, config_name, generator_flags)
 
-    target = writer.WriteSpec(
-        spec, config_name, generator_flags, case_sensitive_filesystem)
+    if ninja_output.tell() > 0:
+      # Only create files for ninja files that actually have contents.
+      with OpenOutput(os.path.join(toplevel_build, output_file)) as ninja_file:
+        ninja_file.write(ninja_output.getvalue())
+      ninja_output.close()
+      master_ninja.subninja(output_file)
+
     if target:
       if name != target.FinalOutput() and spec['toolset'] == 'target':
         target_short_names.setdefault(name, []).append(target)
