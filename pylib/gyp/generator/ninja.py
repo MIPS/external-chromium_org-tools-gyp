@@ -211,7 +211,7 @@ class Target:
 class NinjaWriter:
   def __init__(self, qualified_target, target_outputs, base_dir, build_dir,
                output_file, toplevel_build, output_file_name, flavor,
-               toplevel_dir=None):
+               deps_file=None, toplevel_dir=None):
     """
     base_dir: path from source root to directory containing this gyp file,
               by gyp semantics, all input paths are relative to this
@@ -245,6 +245,7 @@ class NinjaWriter:
     # Relative path from base dir to build dir.
     base_to_top = gyp.common.InvertRelativePath(base_dir, toplevel_dir)
     self.base_to_build = os.path.join(base_to_top, build_dir)
+    self.link_deps_file = deps_file
 
   def ExpandSpecial(self, path, product_dir=None):
     """Expand specials like $!PRODUCT_DIR in |path|.
@@ -395,9 +396,9 @@ class NinjaWriter:
       if len(self.archs) > 1:
         self.arch_subninjas = dict(
             (arch, ninja_syntax.Writer(
-                open(os.path.join(self.toplevel_build,
-                                  self._SubninjaNameForArch(arch)),
-                     'w')))
+                OpenOutput(os.path.join(self.toplevel_build,
+                                        self._SubninjaNameForArch(arch)),
+                           'w')))
             for arch in self.archs)
 
     # Compute predepends for all rules.
@@ -440,7 +441,7 @@ class NinjaWriter:
 
     # Write out the compilation steps, if any.
     link_deps = []
-    sources = spec.get('sources', []) + extra_sources
+    sources = extra_sources + spec.get('sources', [])
     if sources:
       if self.flavor == 'mac' and len(self.archs) > 1:
         # Write subninja file containing compile and link commands scoped to
@@ -477,12 +478,11 @@ class NinjaWriter:
 
     # Write out a link step, if needed.
     output = None
-    is_empty_bundle = True
+    is_empty_bundle = not link_deps and not mac_bundle_depends
     if link_deps or self.target.actions_stamp or actions_depends:
       output = self.WriteTarget(spec, config_name, config, link_deps,
                                 self.target.actions_stamp or actions_depends)
       if self.is_mac_bundle:
-        is_empty_bundle = not link_deps and not mac_bundle_depends
         mac_bundle_depends.append(output)
 
     # Bundle all of the above together, if needed.
@@ -557,7 +557,7 @@ class NinjaWriter:
 
     if self.is_mac_bundle:
       self.WriteMacBundleResources(
-          mac_bundle_resources + extra_mac_bundle_resources, mac_bundle_depends)
+          extra_mac_bundle_resources + mac_bundle_resources, mac_bundle_depends)
       self.WriteMacInfoPlist(mac_bundle_depends)
 
     return stamp
@@ -762,15 +762,17 @@ class NinjaWriter:
       intermediate_plist = self.GypPathToUniqueOutput(
           os.path.basename(info_plist))
       defines = ' '.join([Define(d, self.flavor) for d in defines])
-      info_plist = self.ninja.build(intermediate_plist, 'infoplist', info_plist,
-                                    variables=[('defines',defines)])
+      info_plist = self.ninja.build(
+          intermediate_plist, 'preprocess_infoplist', info_plist,
+          variables=[('defines',defines)])
 
     env = self.GetSortedXcodeEnv(additional_settings=extra_env)
     env = self.ComputeExportEnvString(env)
 
-    self.ninja.build(out, 'mac_tool', info_plist,
-                     variables=[('mactool_cmd', 'copy-info-plist'),
-                                ('env', env)])
+    keys = self.xcode_settings.GetExtraPlistItems()
+    keys = [QuoteShellArgument(v, self.flavor) for v in sum(keys.items(), ())]
+    self.ninja.build(out, 'copy_infoplist', info_plist,
+                     variables=[('env', env), ('keys', keys)])
     bundle_depends.append(out)
 
   def WriteSources(self, ninja_file, config_name, config, sources, predepends,
@@ -982,23 +984,33 @@ class NinjaWriter:
           continue
         linkable = target.Linkable()
         if linkable:
+          if self.link_deps_file:
+            # Save the mapping of link deps.
+            self.link_deps_file.write(self.qualified_target)
+            self.link_deps_file.write(' ')
+            self.link_deps_file.write(target.binary)
+            self.link_deps_file.write('\n')
+
+          new_deps = []
           if (self.flavor == 'win' and
               target.component_objs and
               self.msvs_settings.IsUseLibraryDependencyInputs(config_name)):
-            extra_link_deps |= set(target.component_objs)
+            new_deps = target.component_objs
           elif self.flavor == 'win' and target.import_lib:
-            extra_link_deps.add(target.import_lib)
+            new_deps = [target.import_lib]
           elif target.UsesToc(self.flavor):
             solibs.add(target.binary)
             implicit_deps.add(target.binary + '.TOC')
           else:
-            extra_link_deps.add(target.binary)
+            new_deps = [target.binary]
+          for new_dep in new_deps:
+            if new_dep not in extra_link_deps:
+              extra_link_deps.add(new_dep)
+              link_deps.append(new_dep)
 
         final_output = target.FinalOutput()
         if not linkable or final_output != target.binary:
           implicit_deps.add(final_output)
-
-      link_deps.extend(list(extra_link_deps))
 
     extra_bindings = []
     if self.uses_cpp and self.flavor != 'win':
@@ -1506,7 +1518,9 @@ def GetDefaultConcurrentLinks():
     stat.dwLength = ctypes.sizeof(stat)
     ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
 
-    return max(1, stat.ullTotalPhys / (4 * (2 ** 30)))  # total / 4GB
+    mem_limit = max(1, stat.ullTotalPhys / (4 * (2 ** 30)))  # total / 4GB
+    hard_cap = max(1, int(os.getenv('GYP_LINK_CONCURRENCY_MAX', 2**32)))
+    return min(mem_limit, hard_cap)
   elif sys.platform.startswith('linux'):
     with open("/proc/meminfo") as meminfo:
       memtotal_re = re.compile(r'^MemTotal:\s*(\d*)\s*kB')
@@ -1587,12 +1601,14 @@ def _AddWinLinkRules(master_ninja, embed_manifest, link_incremental):
                     description=dlldesc, command=dllcmd,
                     rspfile='$dll.rsp',
                     rspfile_content='$libs $in_newline $ldflags',
-                    restat=True)
+                    restat=True,
+                    pool='link_pool')
   master_ninja.rule('solink_module' + rule_name_suffix,
                     description=dlldesc, command=dllcmd,
                     rspfile='$dll.rsp',
                     rspfile_content='$libs $in_newline $ldflags',
-                    restat=True)
+                    restat=True,
+                    pool='link_pool')
   # Note that ldflags goes at the end so that it has the option of
   # overriding default settings earlier in the command line.
   exe_cmd = ('%s gyp-win-tool link-wrapper $arch '
@@ -1603,7 +1619,8 @@ def _AddWinLinkRules(master_ninja, embed_manifest, link_incremental):
                     description='LINK%s $out' % rule_name_suffix.upper(),
                     command=exe_cmd,
                     rspfile='$out.rsp',
-                    rspfile_content='$in_newline $libs $ldflags')
+                    rspfile_content='$in_newline $libs $ldflags',
+                    pool='link_pool')
 
 
 def GenerateOutputForConfig(target_list, target_dicts, data, params,
@@ -1960,10 +1977,14 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
                '$in $solibs $libs$postbuilds'),
       pool='link_pool')
     master_ninja.rule(
-      'infoplist',
-      description='INFOPLIST $out',
+      'preprocess_infoplist',
+      description='PREPROCESS INFOPLIST $out',
       command=('$cc -E -P -Wno-trigraphs -x c $defines $in -o $out && '
                'plutil -convert xml1 $out $out'))
+    master_ninja.rule(
+      'copy_infoplist',
+      description='COPY INFOPLIST $in',
+      command='$env ./gyp-mac-tool copy-info-plist $in $out $keys')
     master_ninja.rule(
       'mac_tool',
       description='MACTOOL $mactool_cmd $in',
@@ -2006,6 +2027,14 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   # target_short_names is a map from target short name to a list of Target
   # objects.
   target_short_names = {}
+
+  # Extract the optional link deps file name.
+  LINK_DEPS_FILE = 'link_deps_file'
+  if LINK_DEPS_FILE in generator_flags:
+    link_deps_file = open(generator_flags.get(LINK_DEPS_FILE), 'wb')
+  else:
+    link_deps_file = None
+
   for qualified_target in target_list:
     # qualified_target is like: third_party/icu/icu.gyp:icui18n#target
     build_file, name, toolset = \
@@ -2031,7 +2060,9 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     writer = NinjaWriter(qualified_target, target_outputs, base_path, build_dir,
                          ninja_output,
                          toplevel_build, output_file,
-                         flavor, toplevel_dir=options.toplevel_dir)
+                         flavor, link_deps_file,
+                         toplevel_dir=options.toplevel_dir)
+
     target = writer.WriteSpec(spec, config_name, generator_flags)
 
     if ninja_output.tell() > 0:
