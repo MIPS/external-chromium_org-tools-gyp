@@ -57,7 +57,7 @@ def IsPathSection(section):
     section = section[:-1]
   return section in path_sections or is_path_section_match_re.search(section)
 
-# base_non_configuraiton_keys is a list of key names that belong in the target
+# base_non_configuration_keys is a list of key names that belong in the target
 # itself and should not be propagated into its configurations.  It is merged
 # with a list that can come from the generator to
 # create non_configuration_keys.
@@ -84,7 +84,6 @@ base_non_configuration_keys = [
   'toolset',
   'toolsets',
   'type',
-  'variants',
 
   # Sections that can be found inside targets or configurations, but that
   # should not be propagated from targets into their configurations.
@@ -106,9 +105,6 @@ invalid_configuration_keys = [
   'target_name',
   'type',
 ]
-
-# Controls how the generator want the build file paths.
-absolute_build_file_paths = False
 
 # Controls whether or not the generator supports multiple toolsets.
 multiple_toolsets = False
@@ -229,17 +225,19 @@ def LoadOneBuildFile(build_file_path, data, aux_data, variables, includes,
   aux_data[build_file_path] = {}
 
   # Scan for includes and merge them in.
-  try:
-    if is_target:
-      LoadBuildFileIncludesIntoDict(build_file_data, build_file_path, data,
-                                    aux_data, variables, includes, check)
-    else:
-      LoadBuildFileIncludesIntoDict(build_file_data, build_file_path, data,
-                                    aux_data, variables, None, check)
-  except Exception, e:
-    gyp.common.ExceptionAppend(e,
-                               'while reading includes of ' + build_file_path)
-    raise
+  if ('skip_includes' not in build_file_data or
+      not build_file_data['skip_includes']):
+    try:
+      if is_target:
+        LoadBuildFileIncludesIntoDict(build_file_data, build_file_path, data,
+                                      aux_data, variables, includes, check)
+      else:
+        LoadBuildFileIncludesIntoDict(build_file_data, build_file_path, data,
+                                      aux_data, variables, None, check)
+    except Exception, e:
+      gyp.common.ExceptionAppend(e,
+                                 'while reading includes of ' + build_file_path)
+      raise
 
   return build_file_data
 
@@ -345,10 +343,6 @@ def LoadTargetBuildFile(build_file_path, data, aux_data, variables, includes,
       variables['DEPTH'] = '.'
     else:
       variables['DEPTH'] = d.replace('\\', '/')
-
-  # If the generator needs absolue paths, then do so.
-  if absolute_build_file_paths:
-    build_file_path = os.path.abspath(build_file_path)
 
   if build_file_path in data['target_build_files']:
     # Already loaded.
@@ -552,12 +546,13 @@ class ParallelState(object):
     self.condition.release()
 
 
-def LoadTargetBuildFileParallel(build_file_path, data, aux_data,
-                                variables, includes, depth, check):
+def LoadTargetBuildFilesParallel(build_files, data, aux_data,
+                                 variables, includes, depth, check):
   parallel_state = ParallelState()
   parallel_state.condition = threading.Condition()
-  parallel_state.dependencies = [build_file_path]
-  parallel_state.scheduled = set([build_file_path])
+  # Make copies of the build_files argument that we can modify while working.
+  parallel_state.dependencies = list(build_files)
+  parallel_state.scheduled = set(build_files)
   parallel_state.pending = 0
   parallel_state.data = data
   parallel_state.aux_data = aux_data
@@ -586,7 +581,6 @@ def LoadTargetBuildFileParallel(build_file_path, data, aux_data,
       global_flags = {
         'path_sections': globals()['path_sections'],
         'non_configuration_keys': globals()['non_configuration_keys'],
-        'absolute_build_file_paths': globals()['absolute_build_file_paths'],
         'multiple_toolsets': globals()['multiple_toolsets']}
 
       if not parallel_state.pool:
@@ -2601,14 +2595,6 @@ def Load(build_files, variables, includes, depth, generator_input_info, check,
   non_configuration_keys = base_non_configuration_keys[:]
   non_configuration_keys.extend(generator_input_info['non_configuration_keys'])
 
-  # TODO(mark) handle variants if the generator doesn't want them directly.
-  generator_handles_variants = \
-      generator_input_info['generator_handles_variants']
-
-  global absolute_build_file_paths
-  absolute_build_file_paths = \
-      generator_input_info['generator_wants_absolute_build_file_paths']
-
   global multiple_toolsets
   multiple_toolsets = generator_input_info[
       'generator_supports_multiple_toolsets']
@@ -2626,20 +2612,20 @@ def Load(build_files, variables, includes, depth, generator_input_info, check,
   # track of the keys corresponding to "target" files.
   data = {'target_build_files': set()}
   aux_data = {}
-  for build_file in build_files:
-    # Normalize paths everywhere.  This is important because paths will be
-    # used as keys to the data dict and for references between input files.
-    build_file = os.path.normpath(build_file)
-    try:
-      if parallel:
-        LoadTargetBuildFileParallel(build_file, data, aux_data,
-                                    variables, includes, depth, check)
-      else:
+  # Normalize paths everywhere.  This is important because paths will be
+  # used as keys to the data dict and for references between input files.
+  build_files = set(map(os.path.normpath, build_files))
+  if parallel:
+    LoadTargetBuildFilesParallel(build_files, data, aux_data,
+                                 variables, includes, depth, check)
+  else:
+    for build_file in build_files:
+      try:
         LoadTargetBuildFile(build_file, data, aux_data,
                             variables, includes, depth, check, True)
-    except Exception, e:
-      gyp.common.ExceptionAppend(e, 'while trying to load %s' % build_file)
-      raise
+      except Exception, e:
+        gyp.common.ExceptionAppend(e, 'while trying to load %s' % build_file)
+        raise
 
   # Build a dict to access each target's subdict by qualified name.
   targets = BuildTargetsDict(data)

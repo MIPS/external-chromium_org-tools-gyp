@@ -7,6 +7,7 @@ This module contains classes that help to emulate xcodebuild behavior on top of
 other build systems, such as make and ninja.
 """
 
+import copy
 import gyp.common
 import os.path
 import re
@@ -26,6 +27,10 @@ class XcodeSettings(object):
   # cached at class-level for efficiency.
   _plist_cache = {}
 
+  # Populated lazily by GetIOSPostbuilds.  Shared by all XcodeSettings, so
+  # cached at class-level for efficiency.
+  _codesigning_key_cache = {}
+
   def __init__(self, spec):
     self.spec = spec
 
@@ -39,24 +44,33 @@ class XcodeSettings(object):
     configs = spec['configurations']
     for configname, config in configs.iteritems():
       self.xcode_settings[configname] = config.get('xcode_settings', {})
+      self._ConvertConditionalKeys(configname)
       if self.xcode_settings[configname].get('IPHONEOS_DEPLOYMENT_TARGET',
                                              None):
         self.isIOS = True
-
-      # If you need this, speak up at http://crbug.com/122592
-      conditional_keys = [key for key in self.xcode_settings[configname]
-                          if key.endswith(']')]
-      if conditional_keys:
-        print 'Warning: Conditional keys not implemented, ignoring:', \
-              ' '.join(conditional_keys)
-        for key in conditional_keys:
-          del self.xcode_settings[configname][key]
 
     # This is only non-None temporarily during the execution of some methods.
     self.configname = None
 
     # Used by _AdjustLibrary to match .a and .dylib entries in libraries.
     self.library_re = re.compile(r'^lib([^/]+)\.(a|dylib)$')
+
+  def _ConvertConditionalKeys(self, configname):
+    """Converts or warns on conditional keys.  Xcode supports conditional keys,
+    such as CODE_SIGN_IDENTITY[sdk=iphoneos*].  This is a partial implementation
+    with some keys converted while the rest force a warning."""
+    settings = self.xcode_settings[configname]
+    conditional_keys = [key for key in settings if key.endswith(']')]
+    for key in conditional_keys:
+      # If you need more, speak up at http://crbug.com/122592
+      if key.endswith("[sdk=iphoneos*]"):
+        if configname.endswith("iphoneos"):
+          new_key = key.split("[")[0]
+          settings[new_key] = settings[key]
+      else:
+        print 'Warning: Conditional keys not implemented, ignoring:', \
+              ' '.join(conditional_keys)
+      del settings[key]
 
   def _Settings(self):
     assert self.configname
@@ -261,11 +275,13 @@ class XcodeSettings(object):
   def _GetSdkVersionInfoItem(self, sdk, infoitem):
     return self._GetStdout(['xcodebuild', '-version', '-sdk', sdk, infoitem])
 
-  def _SdkRoot(self):
-    return self.GetPerTargetSetting('SDKROOT', default='')
+  def _SdkRoot(self, configname):
+    if configname is None:
+      configname = self.configname
+    return self.GetPerConfigSetting('SDKROOT', configname, default='')
 
-  def _SdkPath(self):
-    sdk_root = self._SdkRoot()
+  def _SdkPath(self, configname=None):
+    sdk_root = self._SdkRoot(configname)
     if sdk_root.startswith('/'):
       return sdk_root
     if sdk_root not in XcodeSettings._sdk_path_cache:
@@ -665,6 +681,12 @@ class XcodeSettings(object):
             del result[key]
     return result
 
+  def GetPerConfigSetting(self, setting, configname, default=None):
+    if configname in self.xcode_settings:
+      return self.xcode_settings[configname].get(setting, default)
+    else:
+      return self.GetPerTargetSetting(setting, default)
+
   def GetPerTargetSetting(self, setting, default=None):
     """Tries to get xcode_settings.setting from spec. Assumes that the setting
        has the same value in all configurations and throws otherwise."""
@@ -677,7 +699,7 @@ class XcodeSettings(object):
       else:
         assert result == self.xcode_settings[configname].get(setting, None), (
             "Expected per-target setting for '%s', got per-config setting "
-            "(target %s)" % (setting, spec['target_name']))
+            "(target %s)" % (setting, self.spec['target_name']))
     if result is None:
       return default
     return result
@@ -735,7 +757,8 @@ class XcodeSettings(object):
     self.configname = None
     return result
 
-  def GetTargetPostbuilds(self, configname, output, output_binary, quiet=False):
+  def _GetTargetPostbuilds(self, configname, output, output_binary,
+                           quiet=False):
     """Returns a list of shell commands that contain the shell commands
     to run as postbuilds for this target, before the actual postbuilds."""
     # dSYMs need to build before stripping happens.
@@ -743,7 +766,51 @@ class XcodeSettings(object):
         self._GetDebugInfoPostbuilds(configname, output, output_binary, quiet) +
         self._GetStripPostbuilds(configname, output_binary, quiet))
 
-  def _AdjustLibrary(self, library):
+  def _GetIOSPostbuilds(self, configname, output_binary):
+    """Return a shell command to codesign the iOS output binary so it can
+    be deployed to a device.  This should be run as the very last step of the
+    build."""
+    if not (self.isIOS and self.spec['type'] == "executable"):
+      return []
+
+    identity = self.xcode_settings[configname].get('CODE_SIGN_IDENTITY', '')
+    if identity == '':
+      return []
+    if identity not in XcodeSettings._codesigning_key_cache:
+      proc = subprocess.Popen(['security', 'find-identity', '-p', 'codesigning',
+                               '-v'], stdout=subprocess.PIPE)
+      output = proc.communicate()[0].strip()
+      key = None
+      for item in output.split("\n"):
+        if identity in item:
+          assert key == None, (
+              "Multiple codesigning identities for identity: %s" %
+              identity)
+          key = item.split(' ')[1]
+      XcodeSettings._codesigning_key_cache[identity] = key
+    key = XcodeSettings._codesigning_key_cache[identity]
+    if key:
+      # Warn for any unimplemented signing xcode keys.
+      unimpl = ['CODE_SIGN_RESOURCE_RULES_PATH', 'OTHER_CODE_SIGN_FLAGS',
+                'CODE_SIGN_ENTITLEMENTS']
+      keys = set(self.xcode_settings[configname].keys())
+      unimpl = set(unimpl) & keys
+      if unimpl:
+        print 'Warning: Some codesign keys not implemented, ignoring:', \
+            ' '.join(unimpl)
+      return ['codesign --force --sign %s %s' % (key, output_binary)]
+    return []
+
+  def AddImplicitPostbuilds(self, configname, output, output_binary,
+                            postbuilds=[], quiet=False):
+    """Returns a list of shell commands that should run before and after
+    |postbuilds|."""
+    assert output_binary is not None
+    pre = self._GetTargetPostbuilds(configname, output, output_binary, quiet)
+    post = self._GetIOSPostbuilds(configname, output_binary)
+    return pre + postbuilds + post
+
+  def _AdjustLibrary(self, library, config_name=None):
     if library.endswith('.framework'):
       l = '-framework ' + os.path.splitext(os.path.basename(library))[0]
     else:
@@ -752,13 +819,14 @@ class XcodeSettings(object):
         l = '-l' + m.group(1)
       else:
         l = library
-    return l.replace('$(SDKROOT)', self._SdkPath())
+    return l.replace('$(SDKROOT)', self._SdkPath(config_name))
 
-  def AdjustLibraries(self, libraries):
+  def AdjustLibraries(self, libraries, config_name=None):
     """Transforms entries like 'Cocoa.framework' in libraries into entries like
     '-framework Cocoa', 'libcrypto.dylib' into '-lcrypto', etc.
     """
-    libraries = [ self._AdjustLibrary(library) for library in libraries]
+    libraries = [self._AdjustLibrary(library, config_name)
+                 for library in libraries]
     return libraries
 
   def _BuildMachineOSBuild(self):
@@ -768,25 +836,35 @@ class XcodeSettings(object):
     # `xcodebuild -version` output looks like
     #    Xcode 4.6.3
     #    Build version 4H1503
+    # or like
+    #    Xcode 3.2.6
+    #    Component versions: DevToolsCore-1809.0; DevToolsSupport-1806.0
+    #    BuildVersion: 10M2518
     # Convert that to '0463', '4H1503'.
-    version, build = self._GetStdout(['xcodebuild', '-version']).splitlines()
+    version_list = self._GetStdout(['xcodebuild', '-version']).splitlines()
+    version = version_list[0]
+    build = version_list[-1]
     # Be careful to convert "4.2" to "0420":
     version = version.split()[-1].replace('.', '')
     version = (version + '0' * (3 - len(version))).zfill(4)
     build = build.split()[-1]
     return version, build
 
-  def GetExtraPlistItems(self):
+  def _XcodeIOSDeviceFamily(self, configname):
+    family = self.xcode_settings[configname].get('TARGETED_DEVICE_FAMILY', '1')
+    return [int(x) for x in family.split(',')]
+
+  def GetExtraPlistItems(self, configname=None):
     """Returns a dictionary with extra items to insert into Info.plist."""
-    if not XcodeSettings._plist_cache:
-      cache = XcodeSettings._plist_cache
+    if configname not in XcodeSettings._plist_cache:
+      cache = {}
       cache['BuildMachineOSBuild'] = self._BuildMachineOSBuild()
 
       xcode, xcode_build = self._XcodeVersion()
       cache['DTXcode'] = xcode
       cache['DTXcodeBuild'] = xcode_build
 
-      sdk_root = self._SdkRoot()
+      sdk_root = self._SdkRoot(configname)
       cache['DTSDKName'] = sdk_root
       if xcode >= '0430':
         cache['DTSDKBuild'] = self._GetSdkVersionInfoItem(
@@ -794,7 +872,19 @@ class XcodeSettings(object):
       else:
         cache['DTSDKBuild'] = cache['BuildMachineOSBuild']
 
-    return XcodeSettings._plist_cache
+      if self.isIOS:
+        if configname.endswith("iphoneos"):
+          cache['CFBundleSupportedPlatforms'] = ['iPhoneOS']
+        else:
+          cache['CFBundleSupportedPlatforms'] = ['iPhoneSimulator']
+      XcodeSettings._plist_cache[configname] = cache
+
+    # Include extra plist items that are per-target, not per global
+    # XcodeSettings.
+    items = dict(XcodeSettings._plist_cache[configname])
+    if self.isIOS:
+      items['UIDeviceFamily'] = self._XcodeIOSDeviceFamily(configname)
+    return items
 
 
 class MacPrefixHeader(object):
@@ -1051,8 +1141,8 @@ def _GetXcodeEnv(xcode_settings, built_products_dir, srcroot, configuration,
     'TARGET_BUILD_DIR' : built_products_dir,
     'TEMP_DIR' : '${TMPDIR}',
   }
-  if xcode_settings.GetPerTargetSetting('SDKROOT'):
-    env['SDKROOT'] = xcode_settings._SdkPath()
+  if xcode_settings.GetPerConfigSetting('SDKROOT', configuration):
+    env['SDKROOT'] = xcode_settings._SdkPath(configuration)
   else:
     env['SDKROOT'] = ''
 
@@ -1175,3 +1265,35 @@ def GetSpecPostbuildCommands(spec, quiet=False):
             spec['target_name'], postbuild['postbuild_name']))
     postbuilds.append(gyp.common.EncodePOSIXShellList(postbuild['action']))
   return postbuilds
+
+
+def _HasIOSTarget(targets):
+  """Returns true if any target contains the iOS specific key
+  IPHONEOS_DEPLOYMENT_TARGET."""
+  for target_dict in targets.values():
+    for config in target_dict['configurations'].values():
+      if config.get('xcode_settings', {}).get('IPHONEOS_DEPLOYMENT_TARGET'):
+        return True
+  return False
+
+
+def _AddIOSDeviceConfigurations(targets):
+  """Clone all targets and append -iphoneos to the name. Configure these targets
+  to build for iOS devices."""
+  for target_dict in targets.values():
+    for config_name in target_dict['configurations'].keys():
+      config = target_dict['configurations'][config_name]
+      new_config_name = config_name + '-iphoneos'
+      new_config_dict = copy.deepcopy(config)
+      if target_dict['toolset'] == 'target':
+        new_config_dict['xcode_settings']['ARCHS'] = ['armv7']
+        new_config_dict['xcode_settings']['SDKROOT'] = 'iphoneos'
+      target_dict['configurations'][new_config_name] = new_config_dict
+  return targets
+
+def CloneConfigurationForDeviceAndEmulator(target_dicts):
+  """If |target_dicts| contains any iOS targets, automatically create -iphoneos
+  targets for iOS device builds."""
+  if _HasIOSTarget(target_dicts):
+    return _AddIOSDeviceConfigurations(target_dicts)
+  return target_dicts

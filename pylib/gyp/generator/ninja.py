@@ -4,6 +4,7 @@
 
 import copy
 import hashlib
+import json
 import multiprocessing
 import os.path
 import re
@@ -211,7 +212,7 @@ class Target:
 class NinjaWriter:
   def __init__(self, qualified_target, target_outputs, base_dir, build_dir,
                output_file, toplevel_build, output_file_name, flavor,
-               deps_file=None, toplevel_dir=None):
+               toplevel_dir=None):
     """
     base_dir: path from source root to directory containing this gyp file,
               by gyp semantics, all input paths are relative to this
@@ -245,7 +246,6 @@ class NinjaWriter:
     # Relative path from base dir to build dir.
     base_to_top = gyp.common.InvertRelativePath(base_dir, toplevel_dir)
     self.base_to_build = os.path.join(base_to_top, build_dir)
-    self.link_deps_file = deps_file
 
   def ExpandSpecial(self, path, product_dir=None):
     """Expand specials like $!PRODUCT_DIR in |path|.
@@ -769,8 +769,8 @@ class NinjaWriter:
     env = self.GetSortedXcodeEnv(additional_settings=extra_env)
     env = self.ComputeExportEnvString(env)
 
-    keys = self.xcode_settings.GetExtraPlistItems()
-    keys = [QuoteShellArgument(v, self.flavor) for v in sum(keys.items(), ())]
+    keys = self.xcode_settings.GetExtraPlistItems(self.config_name)
+    keys = QuoteShellArgument(json.dumps(keys), self.flavor)
     self.ninja.build(out, 'copy_infoplist', info_plist,
                      variables=[('env', env), ('keys', keys)])
     bundle_depends.append(out)
@@ -984,13 +984,6 @@ class NinjaWriter:
           continue
         linkable = target.Linkable()
         if linkable:
-          if self.link_deps_file:
-            # Save the mapping of link deps.
-            self.link_deps_file.write(self.qualified_target)
-            self.link_deps_file.write(' ')
-            self.link_deps_file.write(target.binary)
-            self.link_deps_file.write('\n')
-
           new_deps = []
           if (self.flavor == 'win' and
               target.component_objs and
@@ -1055,8 +1048,8 @@ class NinjaWriter:
     if self.flavor == 'win':
       library_dirs = [self.msvs_settings.ConvertVSMacros(l, config_name)
                       for l in library_dirs]
-      library_dirs = [QuoteShellArgument('-LIBPATH:' + self.GypPathToNinja(l),
-                                         self.flavor)
+      library_dirs = ['/LIBPATH:' + QuoteShellArgument(self.GypPathToNinja(l),
+                                                       self.flavor)
                       for l in library_dirs]
     else:
       library_dirs = [QuoteShellArgument('-L' + self.GypPathToNinja(l),
@@ -1066,7 +1059,7 @@ class NinjaWriter:
     libraries = gyp.common.uniquer(map(self.ExpandSpecial,
                                        spec.get('libraries', [])))
     if self.flavor == 'mac':
-      libraries = self.xcode_settings.AdjustLibraries(libraries)
+      libraries = self.xcode_settings.AdjustLibraries(libraries, config_name)
     elif self.flavor == 'win':
       libraries = self.msvs_settings.AdjustLibraries(libraries)
 
@@ -1202,17 +1195,16 @@ class NinjaWriter:
     if not self.xcode_settings or spec['type'] == 'none' or not output:
       return ''
     output = QuoteShellArgument(output, self.flavor)
-    target_postbuilds = []
+    postbuilds = gyp.xcode_emulation.GetSpecPostbuildCommands(spec, quiet=True)
     if output_binary is not None:
-      target_postbuilds = self.xcode_settings.GetTargetPostbuilds(
+      postbuilds = self.xcode_settings.AddImplicitPostbuilds(
           self.config_name,
           os.path.normpath(os.path.join(self.base_to_build, output)),
           QuoteShellArgument(
               os.path.normpath(os.path.join(self.base_to_build, output_binary)),
               self.flavor),
-          quiet=True)
-    postbuilds = gyp.xcode_emulation.GetSpecPostbuildCommands(spec, quiet=True)
-    postbuilds = target_postbuilds + postbuilds
+          postbuilds, quiet=True)
+
     if not postbuilds:
       return ''
     # Postbuilds expect to be run in the gyp file's directory, so insert an
@@ -1445,7 +1437,6 @@ def CalculateVariables(default_variables, params):
     default_variables['STATIC_LIB_SUFFIX'] = '.lib'
     default_variables['SHARED_LIB_PREFIX'] = ''
     default_variables['SHARED_LIB_SUFFIX'] = '.dll'
-    generator_flags = params.get('generator_flags', {})
 
     # Copy additional generator configuration data from VS, which is shared
     # by the Windows Ninja generator.
@@ -1455,19 +1446,7 @@ def CalculateVariables(default_variables, params):
     generator_additional_path_sections = getattr(msvs_generator,
         'generator_additional_path_sections', [])
 
-    # Set a variable so conditions can be based on msvs_version.
-    msvs_version = gyp.msvs_emulation.GetVSVersion(generator_flags)
-    default_variables['MSVS_VERSION'] = msvs_version.ShortName()
-
-    # To determine processor word size on Windows, in addition to checking
-    # PROCESSOR_ARCHITECTURE (which reflects the word size of the current
-    # process), it is also necessary to check PROCESSOR_ARCHITEW6432 (which
-    # contains the actual word size of the system when running thru WOW64).
-    if ('64' in os.environ.get('PROCESSOR_ARCHITECTURE', '') or
-        '64' in os.environ.get('PROCESSOR_ARCHITEW6432', '')):
-      default_variables['MSVS_OS_BITS'] = 64
-    else:
-      default_variables['MSVS_OS_BITS'] = 32
+    gyp.msvs_emulation.CalculateCommonVariables(default_variables, params)
   else:
     operating_system = flavor
     if flavor == 'android':
@@ -2028,13 +2007,6 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   # objects.
   target_short_names = {}
 
-  # Extract the optional link deps file name.
-  LINK_DEPS_FILE = 'link_deps_file'
-  if LINK_DEPS_FILE in generator_flags:
-    link_deps_file = open(generator_flags.get(LINK_DEPS_FILE), 'wb')
-  else:
-    link_deps_file = None
-
   for qualified_target in target_list:
     # qualified_target is like: third_party/icu/icu.gyp:icui18n#target
     build_file, name, toolset = \
@@ -2060,8 +2032,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     writer = NinjaWriter(qualified_target, target_outputs, base_path, build_dir,
                          ninja_output,
                          toplevel_build, output_file,
-                         flavor, link_deps_file,
-                         toplevel_dir=options.toplevel_dir)
+                         flavor, toplevel_dir=options.toplevel_dir)
 
     target = writer.WriteSpec(spec, config_name, generator_flags)
 
@@ -2114,6 +2085,10 @@ def CallGenerateOutputForConfig(arglist):
 
 
 def GenerateOutput(target_list, target_dicts, data, params):
+  # Update target_dicts for iOS device builds.
+  target_dicts = gyp.xcode_emulation.CloneConfigurationForDeviceAndEmulator(
+      target_dicts)
+
   user_config = params.get('generator_flags', {}).get('config', None)
   if gyp.common.GetFlavor(params) == 'win':
     target_list, target_dicts = MSVSUtil.ShardTargets(target_list, target_dicts)
