@@ -58,6 +58,7 @@ generator_default_variables = {
 generator_additional_non_configuration_keys = []
 generator_additional_path_sections = []
 generator_extra_sources_for_rules = []
+generator_filelist_path = None
 
 # TODO: figure out how to not build extra host objects in the non-cross-compile
 # case when this is enabled, and enable unconditionally.
@@ -1014,15 +1015,20 @@ class NinjaWriter:
       self.AppendPostbuildVariable(extra_bindings, spec, output, output)
 
     is_executable = spec['type'] == 'executable'
+    # The ldflags config key is not used on mac or win. On those platforms
+    # linker flags are set via xcode_settings and msvs_settings, respectively.
+    env_ldflags = os.environ.get('LDFLAGS', '').split()
     if self.flavor == 'mac':
       ldflags = self.xcode_settings.GetLdflags(config_name,
           self.ExpandSpecial(generator_default_variables['PRODUCT_DIR']),
           self.GypPathToNinja, arch)
+      ldflags = env_ldflags + ldflags
     elif self.flavor == 'win':
       manifest_name = self.GypPathToUniqueOutput(
           self.ComputeOutputFileName(spec))
       ldflags, manifest_files = self.msvs_settings.GetLdflags(config_name,
           self.GypPathToNinja, self.ExpandSpecial, manifest_name, is_executable)
+      ldflags = env_ldflags + ldflags
       self.WriteVariableList(ninja_file, 'manifests', manifest_files)
       command_suffix = _GetWinLinkRuleNameSuffix(
           self.msvs_settings.IsEmbedManifest(config_name),
@@ -1033,8 +1039,7 @@ class NinjaWriter:
     else:
       # Respect environment variables related to build, but target-specific
       # flags can still override them.
-      ldflags = (os.environ.get('LDFLAGS', '').split() +
-                 config.get('ldflags', []))
+      ldflags = env_ldflags + config.get('ldflags', [])
       if is_executable and len(solibs):
         rpath = 'lib/'
         if self.toolset != 'target':
@@ -1458,6 +1463,38 @@ def CalculateVariables(default_variables, params):
     default_variables.setdefault('LIB_DIR',
                                  os.path.join('$!PRODUCT_DIR', 'obj'))
 
+def ComputeOutputDir(params):
+  """Returns the path from the toplevel_dir to the build output directory."""
+  # generator_dir: relative path from pwd to where make puts build files.
+  # Makes migrating from make to ninja easier, ninja doesn't put anything here.
+  generator_dir = os.path.relpath(params['options'].generator_output or '.')
+
+  # output_dir: relative path from generator_dir to the build directory.
+  output_dir = params.get('generator_flags', {}).get('output_dir', 'out')
+
+  # Relative path from source root to our output files.  e.g. "out"
+  return os.path.normpath(os.path.join(generator_dir, output_dir))
+
+
+def CalculateGeneratorInputInfo(params):
+  """Called by __init__ to initialize generator values based on params."""
+  # E.g. "out/gypfiles"
+  toplevel = params['options'].toplevel_dir
+  qualified_out_dir = os.path.normpath(os.path.join(
+      toplevel, ComputeOutputDir(params), 'gypfiles'))
+
+  def gypfile_path(build_file_dir, name):
+    # build_file_dir is absolute, make it relative to toplevel
+    if os.path.isabs(build_file_dir):
+      build_file_dir = gyp.common.RelativePath(build_file_dir, toplevel)
+    name = os.path.join(qualified_out_dir, build_file_dir, name)
+    if not os.path.isdir(os.path.dirname(name)):
+      os.makedirs(os.path.dirname(name))
+    return name
+
+  global generator_filelist_path
+  generator_filelist_path = gypfile_path
+
 
 def OpenOutput(path, mode='w'):
   """Open |path| for writing, creating directories if necessary."""
@@ -1608,18 +1645,10 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
   flavor = gyp.common.GetFlavor(params)
   generator_flags = params.get('generator_flags', {})
 
-  # generator_dir: relative path from pwd to where make puts build files.
-  # Makes migrating from make to ninja easier, ninja doesn't put anything here.
-  generator_dir = os.path.relpath(params['options'].generator_output or '.')
-
-  # output_dir: relative path from generator_dir to the build directory.
-  output_dir = generator_flags.get('output_dir', 'out')
-
   # build_dir: relative path from source root to our output files.
   # e.g. "out/Debug"
-  build_dir = os.path.normpath(os.path.join(generator_dir,
-                                            output_dir,
-                                            config_name))
+  build_dir = os.path.normpath(
+      os.path.join(ComputeOutputDir(params), config_name))
 
   toplevel_build = os.path.join(options.toplevel_dir, build_dir)
 
