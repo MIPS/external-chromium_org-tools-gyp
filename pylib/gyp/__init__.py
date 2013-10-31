@@ -119,14 +119,14 @@ def Load(build_files, format, default_variables={},
                 'generator_wants_static_library_dependencies_adjusted', True),
     'generator_wants_sorted_dependencies':
         getattr(generator, 'generator_wants_sorted_dependencies', False),
-    'generator_filelist_path':
-        getattr(generator, 'generator_filelist_path', None),
+    'generator_filelist_paths':
+        getattr(generator, 'generator_filelist_paths', None),
   }
 
   # Process the input specific to this generator.
   result = gyp.input.Load(build_files, default_variables, includes[:],
                           depth, generator_input_info, check, circular_check,
-                          params['parallel'])
+                          params['parallel'], params['root_targets'])
   return [generator] + result
 
 def NameValueListToDict(name_value_list):
@@ -324,14 +324,16 @@ def gyp_main(args):
   parser.add_option('--no-circular-check', dest='circular_check',
                     action='store_false', default=True, regenerate=False,
                     help="don't check for circular relationships between files")
-  parser.add_option('--parallel', action='store_true',
-                    env_name='GYP_PARALLEL',
-                    help='Use multiprocessing for speed (experimental)')
+  parser.add_option('--no-parallel', action='store_true', default=False,
+                    help='Disable multiprocessing')
   parser.add_option('-S', '--suffix', dest='suffix', default='',
                     help='suffix to add to generated files')
   parser.add_option('--toplevel-dir', dest='toplevel_dir', action='store',
                     default=None, metavar='DIR', type='path',
                     help='directory to use as the root of the source tree')
+  parser.add_option('-R', '--root-target', dest='root_targets',
+                    action='append', metavar='TARGET',
+                    help='include only TARGET and its deep dependencies')
 
   options, build_files_arg = parser.parse_args(args)
   build_files = build_files_arg
@@ -386,9 +388,7 @@ def gyp_main(args):
     if g_o:
       options.generator_output = g_o
 
-  if not options.parallel and options.use_environment:
-    p = os.environ.get('GYP_PARALLEL')
-    options.parallel = bool(p and p != '0')
+  options.parallel = not options.no_parallel
 
   for mode in options.debug:
     gyp.debug[mode] = 1
@@ -492,7 +492,8 @@ def gyp_main(args):
               'build_files_arg': build_files_arg,
               'gyp_binary': sys.argv[0],
               'home_dot_gyp': home_dot_gyp,
-              'parallel': options.parallel}
+              'parallel': options.parallel,
+              'root_targets': options.root_targets}
 
     # Start with the default variables from the command line.
     [generator, flat_list, targets, data] = Load(build_files, format,
