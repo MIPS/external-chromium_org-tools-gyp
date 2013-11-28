@@ -847,10 +847,12 @@ class NinjaWriter:
                                                   self.GypPathToNinja)])
 
     include_dirs = config.get('include_dirs', [])
+    env = self.GetSortedXcodeEnv()
     if self.flavor == 'win':
+      env = self.msvs_settings.GetVSMacroEnv('$!PRODUCT_DIR',
+                                             config=config_name)
       include_dirs = self.msvs_settings.AdjustIncludeDirs(include_dirs,
                                                           config_name)
-    env = self.GetSortedXcodeEnv()
     self.WriteVariableList(ninja_file, 'includes',
         [QuoteShellArgument('-I' + self.GypPathToNinja(i, env), self.flavor)
          for i in include_dirs])
@@ -876,6 +878,7 @@ class NinjaWriter:
                              map(self.ExpandSpecial, cflags_objcc))
     ninja_file.newline()
     outputs = []
+    has_rc_source = False
     for source in sources:
       filename, ext = os.path.splitext(source)
       ext = ext[1:]
@@ -903,6 +906,7 @@ class NinjaWriter:
       elif self.flavor == 'win' and ext == 'rc':
         command = 'rc'
         obj_ext = '.res'
+        has_rc_source = True
       else:
         # Ignore unhandled extensions.
         continue
@@ -920,6 +924,12 @@ class NinjaWriter:
                        implicit=[gch for _, _, gch in implicit],
                        order_only=predepends, variables=variables)
       outputs.append(output)
+
+    if has_rc_source:
+      resource_include_dirs = config.get('resource_include_dirs', include_dirs)
+      self.WriteVariableList(ninja_file, 'resource_includes',
+          [QuoteShellArgument('-I' + self.GypPathToNinja(i, env), self.flavor)
+           for i in resource_include_dirs])
 
     self.WritePchTargets(ninja_file, pch_commands)
 
@@ -1646,9 +1656,8 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
 
   toplevel_build = os.path.join(options.toplevel_dir, build_dir)
 
-  master_ninja = ninja_syntax.Writer(
-      OpenOutput(os.path.join(toplevel_build, 'build.ninja')),
-      width=120)
+  master_ninja_file = OpenOutput(os.path.join(toplevel_build, 'build.ninja'))
+  master_ninja = ninja_syntax.Writer(master_ninja_file, width=120)
 
   # Put build-time support tools in out/{config_name}.
   gyp.common.CopyTool(flavor, toplevel_build)
@@ -1669,8 +1678,8 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     ld = 'link.exe'
     ld_host = '$ld'
   else:
-    cc = 'gcc'
-    cxx = 'g++'
+    cc = 'cc'
+    cxx = 'c++'
     ld = '$cc'
     ldxx = '$cxx'
     ld_host = '$cc_host'
@@ -1821,7 +1830,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
       description='RC $in',
       # Note: $in must be last otherwise rc.exe complains.
       command=('%s gyp-win-tool rc-wrapper '
-               '$arch $rc $defines $includes $rcflags /fo$out $in' %
+               '$arch $rc $defines $resource_includes $rcflags /fo$out $in' %
                sys.executable))
     master_ninja.rule(
       'asm',
@@ -2087,6 +2096,8 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.newline()
     master_ninja.build('all', 'phony', list(all_outputs))
     master_ninja.default(generator_flags.get('default_target', 'all'))
+
+  master_ninja_file.close()
 
 
 def PerformBuild(data, configurations, params):

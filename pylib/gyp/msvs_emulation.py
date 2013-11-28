@@ -363,7 +363,7 @@ class MsvsSettings(object):
     cl('AdditionalOptions', prefix='')
     cflags.extend(['/FI' + f for f in self._Setting(
         ('VCCLCompilerTool', 'ForcedIncludeFiles'), config, default=[])])
-    if self.vs_version.short_name == '2013' or self.vs_version == '2013e':
+    if self.vs_version.short_name in ('2013', '2013e'):
       # New flag required in 2013 to maintain previous PDB behavior.
       cflags.append('/FS')
     # ninja handles parallelism by itself, don't have the compiler do it too.
@@ -420,6 +420,7 @@ class MsvsSettings(object):
     libflags.extend(self._GetAdditionalLibraryDirectories(
         'VCLibrarianTool', config, gyp_to_build_path))
     lib('LinkTimeCodeGeneration', map={'true': '/LTCG'})
+    lib('TargetMachine', map={'1': 'X86', '17': 'X64'}, prefix='/MACHINE:')
     lib('AdditionalOptions')
     return libflags
 
@@ -466,9 +467,19 @@ class MsvsSettings(object):
         else '/MAP'})
     ld('MapExports', map={'true': '/MAPINFO:EXPORTS'})
     ld('AdditionalOptions', prefix='')
-    ld('SubSystem', map={'1': 'CONSOLE', '2': 'WINDOWS'}, prefix='/SUBSYSTEM:')
+
+    minimum_required_version = self._Setting(
+        ('VCLinkerTool', 'MinimumRequiredVersion'), config, default='')
+    if minimum_required_version:
+      minimum_required_version = ',' + minimum_required_version
+    ld('SubSystem',
+       map={'1': 'CONSOLE%s' % minimum_required_version,
+            '2': 'WINDOWS%s' % minimum_required_version},
+       prefix='/SUBSYSTEM:')
+
     ld('TerminalServerAware', map={'1': ':NO', '2': ''}, prefix='/TSAWARE')
     ld('LinkIncremental', map={'1': ':NO', '2': ''}, prefix='/INCREMENTAL')
+    ld('BaseAddress', prefix='/BASE:')
     ld('FixedBaseAddress', map={'1': ':NO', '2': ''}, prefix='/FIXED')
     ld('RandomizedBaseAddress',
         map={'1': ':NO', '2': ''}, prefix='/DYNAMICBASE')

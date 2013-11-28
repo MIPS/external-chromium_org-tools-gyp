@@ -639,6 +639,7 @@ def FindVisualStudioInstallation():
                     for drive in range(ord('C'), ord('Z') + 1)
                     for suffix in ['', ' (x86)']]
   possible_paths = {
+      '2013': r'Microsoft Visual Studio 12.0\Common7\IDE\devenv.com',
       '2012': r'Microsoft Visual Studio 11.0\Common7\IDE\devenv.com',
       '2010': r'Microsoft Visual Studio 10.0\Common7\IDE\devenv.com',
       '2008': r'Microsoft Visual Studio 9.0\Common7\IDE\devenv.com',
@@ -908,6 +909,7 @@ class TestGypXcode(TestGypBase):
     'Checking Dependencies...\n** BUILD SUCCEEDED **\n', # Xcode 3.0/3.1
     'Check dependencies\n** BUILD SUCCEEDED **\n\n',     # Xcode 3.2
     'Check dependencies\n\n\n** BUILD SUCCEEDED **\n\n', # Xcode 4.2
+    'Check dependencies\n\n** BUILD SUCCEEDED **\n\n',   # Xcode 5.0
   )
 
   def build(self, gyp_file, target=None, **kw):
