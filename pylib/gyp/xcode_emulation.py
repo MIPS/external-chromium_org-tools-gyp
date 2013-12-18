@@ -9,11 +9,13 @@ other build systems, such as make and ninja.
 
 import copy
 import gyp.common
+import os
 import os.path
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from gyp.common import GypError
 
 class XcodeSettings(object):
@@ -784,33 +786,38 @@ class XcodeSettings(object):
     if not (self.isIOS and self.spec['type'] == "executable"):
       return []
 
-    identity = self.xcode_settings[configname].get('CODE_SIGN_IDENTITY', '')
-    if identity == '':
+    settings = self.xcode_settings[configname]
+    key = self._GetIOSCodeSignIdentityKey(settings)
+    if not key:
       return []
+
+    # Warn for any unimplemented signing xcode keys.
+    unimpl = ['OTHER_CODE_SIGN_FLAGS']
+    unimpl = set(unimpl) & set(self.xcode_settings[configname].keys())
+    if unimpl:
+      print 'Warning: Some codesign keys not implemented, ignoring: %s' % (
+          ', '.join(sorted(unimpl)))
+
+    return ['%s code-sign-bundle "%s" "%s" "%s" "%s"' % (
+        os.path.join('${TARGET_BUILD_DIR}', 'gyp-mac-tool'), key,
+        settings.get('CODE_SIGN_RESOURCE_RULES_PATH', ''),
+        settings.get('CODE_SIGN_ENTITLEMENTS', ''),
+        settings.get('PROVISIONING_PROFILE', ''))
+    ]
+
+  def _GetIOSCodeSignIdentityKey(self, settings):
+    identity = settings.get('CODE_SIGN_IDENTITY')
+    if not identity:
+      return None
     if identity not in XcodeSettings._codesigning_key_cache:
-      proc = subprocess.Popen(['security', 'find-identity', '-p', 'codesigning',
-                               '-v'], stdout=subprocess.PIPE)
-      output = proc.communicate()[0].strip()
-      key = None
-      for item in output.split("\n"):
-        if identity in item:
-          assert key == None, (
-              "Multiple codesigning identities for identity: %s" %
-              identity)
-          key = item.split(' ')[1]
-      XcodeSettings._codesigning_key_cache[identity] = key
-    key = XcodeSettings._codesigning_key_cache[identity]
-    if key:
-      # Warn for any unimplemented signing xcode keys.
-      unimpl = ['CODE_SIGN_RESOURCE_RULES_PATH', 'OTHER_CODE_SIGN_FLAGS',
-                'CODE_SIGN_ENTITLEMENTS']
-      keys = set(self.xcode_settings[configname].keys())
-      unimpl = set(unimpl) & keys
-      if unimpl:
-        print 'Warning: Some codesign keys not implemented, ignoring:', \
-            ' '.join(unimpl)
-      return ['codesign --force --sign %s %s' % (key, output_binary)]
-    return []
+      output = subprocess.check_output(
+          ['security', 'find-identity', '-p', 'codesigning', '-v'])
+      for line in output.splitlines():
+        if identity in line:
+          assert identity not in XcodeSettings._codesigning_key_cache, (
+              "Multiple codesigning identities for identity: %s" % identity)
+          XcodeSettings._codesigning_key_cache[identity] = line.split()[1]
+    return XcodeSettings._codesigning_key_cache.get(identity, '')
 
   def AddImplicitPostbuilds(self, configname, output, output_binary,
                             postbuilds=[], quiet=False):
@@ -903,8 +910,23 @@ class XcodeSettings(object):
     return items
 
   def _DefaultArch(self):
-    # The default value for ARCHS changed from ['i386'] to ['x86_64'] in
-    # Xcode 5.
+    # For Mac projects, Xcode changed the default value used when ARCHS is not
+    # set from "i386" to "x86_64".
+    #
+    # For iOS projects, if ARCHS is unset, it defaults to "armv7 armv7s" when
+    # building for a device, and the simulator binaries are always build for
+    # "i386".
+    #
+    # For new projects, ARCHS is set to $(ARCHS_STANDARD_INCLUDING_64_BIT),
+    # which correspond to "armv7 armv7s arm64", and when building the simulator
+    # the architecture is either "i386" or "x86_64" depending on the simulated
+    # device (respectively 32-bit or 64-bit device).
+    #
+    # Since the value returned by this function is only used when ARCHS is not
+    # set, then on iOS we return "i386", as the default xcode project generator
+    # does not set ARCHS if it is not set in the .gyp file.
+    if self.isIOS:
+      return 'i386'
     version, build = self._XcodeVersion()
     if version >= '0500':
       return 'x86_64'
