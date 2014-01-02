@@ -52,6 +52,10 @@ if sys.platform == 'win32':
   test.run_gyp('generate-manifest.gyp', chdir=CHDIR)
   test.build('generate-manifest.gyp', test.ALL, chdir=CHDIR)
 
+  # Make sure that generation of .generated.manifest does not cause a relink.
+  test.run_gyp('generate-manifest.gyp', chdir=CHDIR)
+  test.up_to_date('generate-manifest.gyp', test.ALL, chdir=CHDIR)
+
   def test_manifest(filename, generate_manifest, embedded_manifest,
                     extra_manifest):
     exe_file = test.built_file_path(filename, chdir=CHDIR)
@@ -116,4 +120,8 @@ if sys.platform == 'win32':
                 generate_manifest=False,
                 embedded_manifest=False,
                 extra_manifest=True)
+  test_manifest('test_generate_manifest_default_embed_default.exe',
+                generate_manifest=True,
+                embedded_manifest=True,
+                extra_manifest=False)
   test.pass_test()
