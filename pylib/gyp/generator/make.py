@@ -2050,8 +2050,9 @@ def GenerateOutput(target_list, target_dicts, data, params):
       make_global_settings += (
           'ifneq (,$(filter $(origin %s), undefined default))\n' % key)
       # Let gyp-time envvars win over global settings.
-      if key in os.environ:
-        value = os.environ[key]
+      env_key = key.replace('.', '_')  # CC.host -> CC_host
+      if env_key in os.environ:
+        value = os.environ[env_key]
       make_global_settings += '  %s = %s\n' % (key, value)
       make_global_settings += 'endif\n'
     else:
@@ -2093,7 +2094,8 @@ def GenerateOutput(target_list, target_dicts, data, params):
 
     this_make_global_settings = data[build_file].get('make_global_settings', [])
     assert make_global_settings_array == this_make_global_settings, (
-        "make_global_settings needs to be the same for all targets.")
+        "make_global_settings needs to be the same for all targets. %s vs. %s" %
+        (this_make_global_settings, make_global_settings))
 
     build_files.add(gyp.common.RelativePath(build_file, options.toplevel_dir))
     included_files = data[build_file]['included_files']
