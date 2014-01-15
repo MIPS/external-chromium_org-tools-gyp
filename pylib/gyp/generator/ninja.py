@@ -1559,6 +1559,7 @@ def GetDefaultConcurrentLinks():
     hard_cap = max(1, int(os.getenv('GYP_LINK_CONCURRENCY_MAX', 2**32)))
     # return min(mem_limit, hard_cap)
     # TODO(scottmg): Temporary speculative fix for OOM on builders
+    # See http://crbug.com/333000.
     return 2
   elif sys.platform.startswith('linux'):
     with open("/proc/meminfo") as meminfo:
@@ -1605,10 +1606,12 @@ def _AddWinLinkRules(master_ninja, embed_manifest):
                'resname': resource_name,
                'embed': embed_manifest }
   rule_name_suffix = _GetWinLinkRuleNameSuffix(embed_manifest)
+  use_separate_mspdbsrv = (
+      int(os.environ.get('GYP_USE_SEPARATE_MSPDBSRV', '0')) != 0)
   dlldesc = 'LINK%s(DLL) $binary' % rule_name_suffix.upper()
-  dllcmd = ('%s gyp-win-tool link-wrapper $arch '
+  dllcmd = ('%s gyp-win-tool link-wrapper $arch %s '
             '$ld /nologo $implibflag /DLL /OUT:$binary '
-            '@$binary.rsp' % sys.executable)
+            '@$binary.rsp' % (sys.executable, use_separate_mspdbsrv))
   dllcmd = FullLinkCommand(dllcmd, '$binary', 'dll')
   master_ninja.rule('solink' + rule_name_suffix,
                     description=dlldesc, command=dllcmd,
@@ -1624,9 +1627,9 @@ def _AddWinLinkRules(master_ninja, embed_manifest):
                     pool='link_pool')
   # Note that ldflags goes at the end so that it has the option of
   # overriding default settings earlier in the command line.
-  exe_cmd = ('%s gyp-win-tool link-wrapper $arch '
+  exe_cmd = ('%s gyp-win-tool link-wrapper $arch %s '
              '$ld /nologo /OUT:$binary @$binary.rsp' %
-              sys.executable)
+              (sys.executable, use_separate_mspdbsrv))
   exe_cmd = FullLinkCommand(exe_cmd, '$binary', 'exe')
   master_ninja.rule('link' + rule_name_suffix,
                     description='LINK%s $binary' % rule_name_suffix.upper(),
@@ -1891,7 +1894,7 @@ def GenerateOutputForConfig(target_list, target_dicts, data, params,
     master_ninja.rule(
         'alink',
         description='LIB $out',
-        command=('%s gyp-win-tool link-wrapper $arch '
+        command=('%s gyp-win-tool link-wrapper $arch False '
                  '$ar /nologo /ignore:4221 /OUT:$out @$out.rsp' %
                  sys.executable),
         rspfile='$out.rsp',
