@@ -163,6 +163,19 @@ class MsvsSettings(object):
 
     self.msvs_cygwin_dirs = spec.get('msvs_cygwin_dirs', ['.'])
 
+    unsupported_fields = [
+        'msvs_prebuild',
+        'msvs_postbuild',
+    ]
+    unsupported = []
+    for field in unsupported_fields:
+      for config in configs.values():
+        if field in config:
+          unsupported += ["%s not supported (target %s)." %
+                          (field, spec['target_name'])]
+    if unsupported:
+      raise Exception('\n'.join(unsupported))
+
   def GetVSMacroEnv(self, base_to_build=None, config=None):
     """Get a dict of variables mapping internal VS macro names to their gyp
     equivalents."""
