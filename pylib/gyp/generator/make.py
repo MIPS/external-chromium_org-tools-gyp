@@ -1951,7 +1951,8 @@ def GenerateOutput(target_list, target_dicts, data, params):
     # We write the file in the base_path directory.
     output_file = os.path.join(options.depth, base_path, base_name)
     if options.generator_output:
-      output_file = os.path.join(options.generator_output, output_file)
+      output_file = os.path.join(
+          options.depth, options.generator_output, base_path, base_name)
     base_path = gyp.common.RelativePath(os.path.dirname(build_file),
                                         options.toplevel_dir)
     return base_path, output_file
@@ -1974,7 +1975,8 @@ def GenerateOutput(target_list, target_dicts, data, params):
   makefile_path = os.path.join(options.toplevel_dir, makefile_name)
   if options.generator_output:
     global srcdir_prefix
-    makefile_path = os.path.join(options.generator_output, makefile_path)
+    makefile_path = os.path.join(
+        options.toplevel_dir, options.generator_output, makefile_name)
     srcdir = gyp.common.RelativePath(srcdir, options.generator_output)
     srcdir_prefix = '$(srcdir)/'
 
@@ -2050,8 +2052,9 @@ def GenerateOutput(target_list, target_dicts, data, params):
       make_global_settings += (
           'ifneq (,$(filter $(origin %s), undefined default))\n' % key)
       # Let gyp-time envvars win over global settings.
-      if key in os.environ:
-        value = os.environ[key]
+      env_key = key.replace('.', '_')  # CC.host -> CC_host
+      if env_key in os.environ:
+        value = os.environ[env_key]
       make_global_settings += '  %s = %s\n' % (key, value)
       make_global_settings += 'endif\n'
     else:
@@ -2093,7 +2096,8 @@ def GenerateOutput(target_list, target_dicts, data, params):
 
     this_make_global_settings = data[build_file].get('make_global_settings', [])
     assert make_global_settings_array == this_make_global_settings, (
-        "make_global_settings needs to be the same for all targets.")
+        "make_global_settings needs to be the same for all targets. %s vs. %s" %
+        (this_make_global_settings, make_global_settings))
 
     build_files.add(gyp.common.RelativePath(build_file, options.toplevel_dir))
     included_files = data[build_file]['included_files']

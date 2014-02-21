@@ -28,8 +28,8 @@ def _import_OrderedDict():
   try:
     return collections.OrderedDict
   except AttributeError:
-    import ordered_dict
-    return ordered_dict.OrderedDict
+    import gyp.ordered_dict
+    return gyp.ordered_dict.OrderedDict
 OrderedDict = _import_OrderedDict()
 
 
@@ -209,13 +209,14 @@ def _FixPaths(paths):
 
 
 def _ConvertSourcesToFilterHierarchy(sources, prefix=None, excluded=None,
-                                     list_excluded=True):
+                                     list_excluded=True, msvs_version=None):
   """Converts a list split source file paths into a vcproj folder hierarchy.
 
   Arguments:
     sources: A list of source file paths split.
     prefix: A list of source file path layers meant to apply to each of sources.
     excluded: A set of excluded files.
+    msvs_version: A MSVSVersion object.
 
   Returns:
     A hierarchy of filenames and MSVSProject.Filter objects that matches the
@@ -239,23 +240,36 @@ def _ConvertSourcesToFilterHierarchy(sources, prefix=None, excluded=None,
         excluded_result.append(filename)
       else:
         result.append(filename)
-    else:
+    elif msvs_version and not msvs_version.UsesVcxproj():
+      # For MSVS 2008 and earlier, we need to process all files before walking
+      # the sub folders.
       if not folders.get(s[0]):
         folders[s[0]] = []
       folders[s[0]].append(s[1:])
+    else:
+      contents = _ConvertSourcesToFilterHierarchy([s[1:]], prefix + [s[0]],
+                                                  excluded=excluded,
+                                                  list_excluded=list_excluded,
+                                                  msvs_version=msvs_version)
+      contents = MSVSProject.Filter(s[0], contents=contents)
+      result.append(contents)
   # Add a folder for excluded files.
   if excluded_result and list_excluded:
     excluded_folder = MSVSProject.Filter('_excluded_files',
                                          contents=excluded_result)
     result.append(excluded_folder)
+
+  if msvs_version and msvs_version.UsesVcxproj():
+    return result
+
   # Populate all the folders.
   for f in folders:
     contents = _ConvertSourcesToFilterHierarchy(folders[f], prefix=prefix + [f],
                                                 excluded=excluded,
-                                                list_excluded=list_excluded)
+                                                list_excluded=list_excluded,
+                                                msvs_version=msvs_version)
     contents = MSVSProject.Filter(f, contents=contents)
     result.append(contents)
-
   return result
 
 
@@ -978,8 +992,9 @@ def _GenerateMSVSProject(project, options, version, generator_flags):
                         actions_to_add)
   list_excluded = generator_flags.get('msvs_list_excluded_files', True)
   sources, excluded_sources, excluded_idl = (
-      _AdjustSourcesAndConvertToFilterHierarchy(
-          spec, options, project_dir, sources, excluded_sources, list_excluded))
+      _AdjustSourcesAndConvertToFilterHierarchy(spec, options, project_dir,
+                                                sources, excluded_sources,
+                                                list_excluded, version))
 
   # Add in files.
   missing_sources = _VerifySourcesExist(sources, project_dir)
@@ -1423,7 +1438,7 @@ def _PrepareListOfSources(spec, generator_flags, gyp_file):
 
 
 def _AdjustSourcesAndConvertToFilterHierarchy(
-    spec, options, gyp_dir, sources, excluded_sources, list_excluded):
+    spec, options, gyp_dir, sources, excluded_sources, list_excluded, version):
   """Adjusts the list of sources and excluded sources.
 
   Also converts the sets to lists.
@@ -1434,6 +1449,7 @@ def _AdjustSourcesAndConvertToFilterHierarchy(
     gyp_dir: The path to the gyp file being processed.
     sources: A set of sources to be included for this project.
     excluded_sources: A set of sources to be excluded for this project.
+    version: A MSVSVersion object.
   Returns:
     A trio of (list of sources, list of excluded sources,
                path of excluded IDL file)
@@ -1458,7 +1474,8 @@ def _AdjustSourcesAndConvertToFilterHierarchy(
   # Convert to folders and the right slashes.
   sources = [i.split('\\') for i in sources]
   sources = _ConvertSourcesToFilterHierarchy(sources, excluded=fully_excluded,
-                                             list_excluded=list_excluded)
+                                             list_excluded=list_excluded,
+                                             msvs_version=version)
 
   # Prune filters with a single child to flatten ugly directory structures
   # such as ../../src/modules/module1 etc.
@@ -2890,7 +2907,7 @@ def _FinalizeMSBuildSettings(spec, configuration):
     # Visual Studio 2010 has TR1
     defines = [d for d in defines if d != '_HAS_TR1=0']
     # Warn of ignored settings
-    ignored_settings = ['msvs_prebuild', 'msvs_postbuild', 'msvs_tool_files']
+    ignored_settings = ['msvs_tool_files']
     for ignored_setting in ignored_settings:
       value = configuration.get(ignored_setting)
       if value:
@@ -2899,9 +2916,8 @@ def _FinalizeMSBuildSettings(spec, configuration):
 
   defines = [_EscapeCppDefineForMSBuild(d) for d in defines]
   disabled_warnings = _GetDisabledWarnings(configuration)
-  # TODO(jeanluc) Validate & warn that we don't translate
-  # prebuild = configuration.get('msvs_prebuild')
-  # postbuild = configuration.get('msvs_postbuild')
+  prebuild = configuration.get('msvs_prebuild')
+  postbuild = configuration.get('msvs_postbuild')
   def_file = _GetModuleDefinition(spec)
   precompiled_header = configuration.get('msvs_precompiled_header')
 
@@ -2949,6 +2965,10 @@ def _FinalizeMSBuildSettings(spec, configuration):
   if def_file:
     _ToolAppend(msbuild_settings, 'Link', 'ModuleDefinitionFile', def_file)
   configuration['finalized_msbuild_settings'] = msbuild_settings
+  if prebuild:
+    _ToolAppend(msbuild_settings, 'PreBuildEvent', 'Command', prebuild)
+  if postbuild:
+    _ToolAppend(msbuild_settings, 'PostBuildEvent', 'Command', postbuild)
 
 
 def _GetValueFormattedForMSBuild(tool_name, name, value):
@@ -3133,7 +3153,7 @@ def _GenerateMSBuildProject(project, options, version, generator_flags):
       _AdjustSourcesAndConvertToFilterHierarchy(spec, options,
                                                 project_dir, sources,
                                                 excluded_sources,
-                                                list_excluded))
+                                                list_excluded, version))
 
   # Don't add actions if we are using an external builder like ninja.
   if not spec.get('msvs_external_builder'):
