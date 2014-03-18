@@ -21,8 +21,28 @@
       },
     },
     {
+      'target_name': 'shared_32_64_bundle',
+      'product_name': 'My Framework',
+      'type': 'shared_library',
+      'mac_bundle': 1,
+      'sources': [ 'my_file.cc' ],
+      'xcode_settings': {
+        'ARCHS': [ 'i386', 'x86_64' ],
+      },
+    },
+    {
       'target_name': 'module_32_64',
       'type': 'loadable_module',
+      'sources': [ 'my_file.cc' ],
+      'xcode_settings': {
+        'ARCHS': [ 'i386', 'x86_64' ],
+      },
+    },
+    {
+      'target_name': 'module_32_64_bundle',
+      'product_name': 'My Bundle',
+      'type': 'loadable_module',
+      'mac_bundle': 1,
       'sources': [ 'my_file.cc' ],
       'xcode_settings': {
         'ARCHS': [ 'i386', 'x86_64' ],
@@ -61,7 +81,7 @@
       'target_name': 'exe_32_64_no_sources',
       'type': 'executable',
       'dependencies': [
-        ':static_32_64',
+        'static_32_64',
       ],
       'sources': [],
       'xcode_settings': {
