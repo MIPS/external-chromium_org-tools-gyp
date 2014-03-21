@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import stat
 import string
 import sys
 
@@ -89,9 +90,19 @@ class WinTool(object):
     """Emulation of rm -rf out && cp -af in out."""
     if os.path.exists(dest):
       if os.path.isdir(dest):
-        shutil.rmtree(dest)
+        def _on_error(fn, path, excinfo):
+          # The operation failed, possibly because the file is set to
+          # read-only. If that's why, make it writable and try the op again.
+          if not os.access(path, os.W_OK):
+            os.chmod(path, stat.S_IWRITE)
+          fn(path)
+        shutil.rmtree(dest, onerror=_on_error)
       else:
+        if not os.access(dest, os.W_OK):
+          # Attempt to make the file writable before deleting it.
+          os.chmod(dest, stat.S_IWRITE)
         os.unlink(dest)
+
     if os.path.isdir(source):
       shutil.copytree(source, dest)
     else:
@@ -287,6 +298,17 @@ class WinTool(object):
     args = open(rspfile).read()
     dir = dir[0] if dir else None
     return subprocess.call(args, shell=True, env=env, cwd=dir)
+
+  def ExecClCompile(self, project_dir, selected_files):
+    """Executed by msvs-ninja projects when the 'ClCompile' target is used to
+    build selected C/C++ files."""
+    project_dir = os.path.relpath(project_dir, BASE_DIR)
+    selected_files = selected_files.split(';')
+    ninja_targets = [os.path.join(project_dir, filename) + '^^'
+        for filename in selected_files]
+    cmd = ['ninja.exe']
+    cmd.extend(ninja_targets)
+    return subprocess.call(cmd, shell=True, cwd=BASE_DIR)
 
 if __name__ == '__main__':
   sys.exit(main(sys.argv[1:]))
