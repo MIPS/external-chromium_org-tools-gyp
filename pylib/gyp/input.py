@@ -45,18 +45,31 @@ base_path_sections = [
   'outputs',
   'sources',
 ]
-path_sections = []
-
-is_path_section_charset = set('=+?!')
-is_path_section_match_re = re.compile('_(dir|file|path)s?$')
+path_sections = set()
 
 def IsPathSection(section):
-  # If section ends in one of these characters, it's applied to a section
+  # If section ends in one of the '=+?!' characters, it's applied to a section
   # without the trailing characters.  '/' is notably absent from this list,
   # because there's no way for a regular expression to be treated as a path.
-  while section[-1:] in is_path_section_charset:
+  while section[-1:] in '=+?!':
     section = section[:-1]
-  return section in path_sections or is_path_section_match_re.search(section)
+
+  if section in path_sections:
+    return True
+
+  # Sections mathing the regexp '_(dir|file|path)s?$' are also
+  # considered PathSections. Using manual string matching since that
+  # is much faster than the regexp and this can be called hundreds of
+  # thousands of times so micro performance matters.
+  if "_" in section:
+    tail = section[-6:]
+    if tail[-1] == 's':
+      tail = tail[:-1]
+    if tail[-5:] in ('_file', '_path'):
+      return True
+    return tail[-4:] == '_dir'
+
+  return False
 
 # base_non_configuration_keys is a list of key names that belong in the target
 # itself and should not be propagated into its configurations.  It is merged
@@ -588,7 +601,7 @@ def LoadTargetBuildFilesParallel(build_files, data, aux_data,
         'multiple_toolsets': globals()['multiple_toolsets']}
 
       if not parallel_state.pool:
-        parallel_state.pool = multiprocessing.Pool(8)
+        parallel_state.pool = multiprocessing.Pool(multiprocessing.cpu_count())
       parallel_state.pool.apply_async(
           CallLoadTargetBuildFile,
           args = (global_flags, dependency,
@@ -1000,6 +1013,58 @@ def ExpandVariables(input, phase, variables, build_file):
 
   return output
 
+# The same condition is often evaluated over and over again so it
+# makes sense to cache as much as possible between evaluations.
+cached_conditions_asts = {}
+
+def EvalCondition(condition, conditions_key, phase, variables, build_file):
+  """Returns the dict that should be used or None if the result was
+  that nothing should be used."""
+  if not isinstance(condition, list):
+    raise GypError(conditions_key + ' must be a list')
+  if len(condition) != 2 and len(condition) != 3:
+    # It's possible that condition[0] won't work in which case this
+    # attempt will raise its own IndexError.  That's probably fine.
+    raise GypError(conditions_key + ' ' + condition[0] +
+                   ' must be length 2 or 3, not ' + str(len(condition)))
+
+  [cond_expr, true_dict] = condition[0:2]
+  false_dict = None
+  if len(condition) == 3:
+    false_dict = condition[2]
+
+  # Do expansions on the condition itself.  Since the conditon can naturally
+  # contain variable references without needing to resort to GYP expansion
+  # syntax, this is of dubious value for variables, but someone might want to
+  # use a command expansion directly inside a condition.
+  cond_expr_expanded = ExpandVariables(cond_expr, phase, variables,
+                                       build_file)
+  if not isinstance(cond_expr_expanded, str) and \
+     not isinstance(cond_expr_expanded, int):
+    raise ValueError, \
+          'Variable expansion in this context permits str and int ' + \
+            'only, found ' + cond_expr_expanded.__class__.__name__
+
+  try:
+    if cond_expr_expanded in cached_conditions_asts:
+      ast_code = cached_conditions_asts[cond_expr_expanded]
+    else:
+      ast_code = compile(cond_expr_expanded, '<string>', 'eval')
+      cached_conditions_asts[cond_expr_expanded] = ast_code
+    if eval(ast_code, {'__builtins__': None}, variables):
+      return true_dict
+    return false_dict
+  except SyntaxError, e:
+    syntax_error = SyntaxError('%s while evaluating condition \'%s\' in %s '
+                               'at character %d.' %
+                               (str(e.args[0]), e.text, build_file, e.offset),
+                               e.filename, e.lineno, e.offset, e.text)
+    raise syntax_error
+  except NameError, e:
+    gyp.common.ExceptionAppend(e, 'while evaluating condition \'%s\' in %s' %
+                               (cond_expr_expanded, build_file))
+    raise GypError(e)
+
 
 def ProcessConditionsInDict(the_dict, phase, variables, build_file):
   # Process a 'conditions' or 'target_conditions' section in the_dict,
@@ -1035,48 +1100,8 @@ def ProcessConditionsInDict(the_dict, phase, variables, build_file):
   del the_dict[conditions_key]
 
   for condition in conditions_list:
-    if not isinstance(condition, list):
-      raise GypError(conditions_key + ' must be a list')
-    if len(condition) != 2 and len(condition) != 3:
-      # It's possible that condition[0] won't work in which case this
-      # attempt will raise its own IndexError.  That's probably fine.
-      raise GypError(conditions_key + ' ' + condition[0] +
-                     ' must be length 2 or 3, not ' + str(len(condition)))
-
-    [cond_expr, true_dict] = condition[0:2]
-    false_dict = None
-    if len(condition) == 3:
-      false_dict = condition[2]
-
-    # Do expansions on the condition itself.  Since the conditon can naturally
-    # contain variable references without needing to resort to GYP expansion
-    # syntax, this is of dubious value for variables, but someone might want to
-    # use a command expansion directly inside a condition.
-    cond_expr_expanded = ExpandVariables(cond_expr, phase, variables,
-                                         build_file)
-    if not isinstance(cond_expr_expanded, str) and \
-       not isinstance(cond_expr_expanded, int):
-      raise ValueError, \
-            'Variable expansion in this context permits str and int ' + \
-            'only, found ' + expanded.__class__.__name__
-
-    try:
-      ast_code = compile(cond_expr_expanded, '<string>', 'eval')
-
-      if eval(ast_code, {'__builtins__': None}, variables):
-        merge_dict = true_dict
-      else:
-        merge_dict = false_dict
-    except SyntaxError, e:
-      syntax_error = SyntaxError('%s while evaluating condition \'%s\' in %s '
-                                 'at character %d.' %
-                                 (str(e.args[0]), e.text, build_file, e.offset),
-                                 e.filename, e.lineno, e.offset, e.text)
-      raise syntax_error
-    except NameError, e:
-      gyp.common.ExceptionAppend(e, 'while evaluating condition \'%s\' in %s' %
-                                 (cond_expr_expanded, build_file))
-      raise GypError(e)
+    merge_dict = EvalCondition(condition, conditions_key, phase, variables,
+                               build_file)
 
     if merge_dict != None:
       # Expand variables and nested conditinals in the merge_dict before
@@ -1480,6 +1505,9 @@ class DependencyGraphNode(object):
     # appear in flat_list after all of its dependencies, and before all of its
     # dependents.
     flat_list = []
+    # flat_set is to make "is in" checks of flat_list. At all times
+    # set(flat_list) == flat_set.
+    flat_set = set()
 
     # in_degree_zeros is the list of DependencyGraphNodes that have no
     # dependencies not in flat_list.  Initially, it is a copy of the children
@@ -1494,13 +1522,17 @@ class DependencyGraphNode(object):
       # always be accessed at a consistent position.
       node = in_degree_zeros.pop()
       flat_list.append(node.ref)
+      flat_set.add(node.ref)
 
       # Look at dependents of the node just added to flat_list.  Some of them
       # may now belong in in_degree_zeros.
       for node_dependent in node.dependents:
         is_in_degree_zero = True
+        # TODO: We want to check through the
+        # node_dependent.dependencies list but if it's long and we
+        # always start at the beginning, then we get O(n^2) behaviour.
         for node_dependent_dependency in node_dependent.dependencies:
-          if not node_dependent_dependency.ref in flat_list:
+          if not node_dependent_dependency.ref in flat_set:
             # The dependent one or more dependencies not in flat_list.  There
             # will be more chances to add it to flat_list when examining
             # it again as a dependent of those other dependencies, provided
@@ -1602,15 +1634,22 @@ class DependencyGraphNode(object):
   def DeepDependencies(self, dependencies=None):
     """Returns a list of all of a target's dependencies, recursively."""
     if dependencies == None:
-      dependencies = []
+      # Using a list to get ordered output and a set to do fast "is it
+      # already added" checks.
+      dependencies = ([], set())
+
+    dependency_list, dependency_set = dependencies
 
     for dependency in self.dependencies:
       # Check for None, corresponding to the root node.
-      if dependency.ref != None and dependency.ref not in dependencies:
-        dependencies.append(dependency.ref)
+      if dependency.ref is None:
+        continue
+      if dependency.ref not in dependency_set:
+        dependency_list.append(dependency.ref)
+        dependency_set.add(dependency.ref)
         dependency.DeepDependencies(dependencies)
 
-    return dependencies
+    return dependency_list
 
   def _LinkDependenciesInternal(self, targets, include_shared_libraries,
                                 dependencies=None, initial=True):
@@ -2663,8 +2702,8 @@ def SetGeneratorGlobals(generator_input_info):
   # Set up path_sections and non_configuration_keys with the default data plus
   # the generator-specific data.
   global path_sections
-  path_sections = base_path_sections[:]
-  path_sections.extend(generator_input_info['path_sections'])
+  path_sections = set(base_path_sections)
+  path_sections.update(generator_input_info['path_sections'])
 
   global non_configuration_keys
   non_configuration_keys = base_non_configuration_keys[:]
