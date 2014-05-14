@@ -188,11 +188,17 @@ class AndroidMkWriter(object):
     self.WriteLn('LOCAL_MODULE_TAGS := optional')
     if self.toolset == 'host':
       self.WriteLn('LOCAL_IS_HOST_MODULE := true')
-    self.WriteLn('LOCAL_MODULE_TARGET_ARCH := $(TARGET_$(GYP_VAR_PREFIX)ARCH)')
+    else:
+      self.WriteLn('LOCAL_MODULE_TARGET_ARCH := '
+                   '$(TARGET_$(GYP_VAR_PREFIX)ARCH)')
 
     # Grab output directories; needed for Actions and Rules.
-    self.WriteLn('gyp_intermediate_dir := '
-                 '$(call local-intermediates-dir,,$(GYP_VAR_PREFIX))')
+    if self.toolset == 'host':
+      self.WriteLn('gyp_intermediate_dir := '
+                   '$(call local-intermediates-dir)')
+    else:
+      self.WriteLn('gyp_intermediate_dir := '
+                   '$(call local-intermediates-dir,,$(GYP_VAR_PREFIX))')
     self.WriteLn('gyp_shared_intermediate_dir := '
                  '$(call intermediates-dir-for,GYP,shared,,,$(GYP_VAR_PREFIX))')
     self.WriteLn()
@@ -296,6 +302,7 @@ class AndroidMkWriter(object):
       # writing duplicate dummy rules for those outputs.
       main_output = make.QuoteSpaces(self.LocalPathify(outputs[0]))
       self.WriteLn('%s: gyp_local_path := $(LOCAL_PATH)' % main_output)
+      self.WriteLn('%s: gyp_var_prefix := $(GYP_VAR_PREFIX)' % main_output)
       self.WriteLn('%s: gyp_intermediate_dir := '
                    '$(abspath $(gyp_intermediate_dir))' % main_output)
       self.WriteLn('%s: gyp_shared_intermediate_dir := '
@@ -393,6 +400,7 @@ class AndroidMkWriter(object):
         outputs = map(self.LocalPathify, outputs)
         main_output = outputs[0]
         self.WriteLn('%s: gyp_local_path := $(LOCAL_PATH)' % main_output)
+        self.WriteLn('%s: gyp_var_prefix := $(GYP_VAR_PREFIX)' % main_output)
         self.WriteLn('%s: gyp_intermediate_dir := '
                      '$(abspath $(gyp_intermediate_dir))' % main_output)
         self.WriteLn('%s: gyp_shared_intermediate_dir := '
@@ -874,7 +882,8 @@ class AndroidMkWriter(object):
     else:
       self.WriteLn('LOCAL_MODULE_PATH := $(PRODUCT_OUT)/gyp_stamp')
       self.WriteLn('LOCAL_UNINSTALLABLE_MODULE := true')
-      self.WriteLn('LOCAL_2ND_ARCH_VAR_PREFIX := $(GYP_VAR_PREFIX)')
+      if self.toolset == 'target':
+        self.WriteLn('LOCAL_2ND_ARCH_VAR_PREFIX := $(GYP_VAR_PREFIX)')
       self.WriteLn()
       self.WriteLn('include $(BUILD_SYSTEM)/base_rules.mk')
       self.WriteLn()
@@ -882,8 +891,9 @@ class AndroidMkWriter(object):
       self.WriteLn('\t$(hide) echo "Gyp timestamp: $@"')
       self.WriteLn('\t$(hide) mkdir -p $(dir $@)')
       self.WriteLn('\t$(hide) touch $@')
-      self.WriteLn()
-      self.WriteLn('LOCAL_2ND_ARCH_VAR_PREFIX :=')
+      if self.toolset == 'target':
+        self.WriteLn()
+        self.WriteLn('LOCAL_2ND_ARCH_VAR_PREFIX :=')
 
 
   def WriteList(self, value_list, variable=None, prefix='',
@@ -933,7 +943,7 @@ class AndroidMkWriter(object):
         'INPUT_ROOT': expansion,
         'INPUT_DIRNAME': dirname,
         }
-    return path
+    return os.path.normpath(path)
 
 
 def PerformBuild(data, configurations, params):
