@@ -14,6 +14,8 @@ import gyp.ninja_syntax as ninja_syntax
 import os
 import posixpath
 
+debug = False
+
 generator_supports_multiple_toolsets = True
 
 generator_wants_static_library_dependencies_adjusted = False
@@ -32,26 +34,29 @@ for unused in ['RULE_INPUT_PATH', 'RULE_INPUT_ROOT', 'RULE_INPUT_NAME',
                'CONFIGURATION_NAME']:
   generator_default_variables[unused] = ''
 
-def __MakeRelativeTargetName(path):
-  """Converts a gyp target name into a relative name. For example, the path to a
-  gyp file may be something like c:\foo\bar.gyp:target, this converts it to
-  bar.gyp.
-  """
-  prune_path = os.getcwd()
-  if path.startswith(prune_path):
-    path = path[len(prune_path):]
-  # Gyp paths are always posix style.
-  path = path.replace('\\', '/')
-  if path.endswith('#target'):
-    path = path[0:len(path) - len('#target')]
-  return path
-
 def __ExtractBasePath(target):
   """Extracts the path components of the specified gyp target path."""
   last_index = target.rfind('/')
   if last_index == -1:
     return ''
   return target[0:(last_index + 1)]
+
+def __ResolveParent(path, base_path_components):
+  """Resolves |path|, which starts with at least one '../'. Returns an empty
+  string if the path shouldn't be considered. See __AddSources() for a
+  description of |base_path_components|."""
+  depth = 0
+  while path.startswith('../'):
+    depth += 1
+    path = path[3:]
+  # Relative includes may go outside the source tree. For example, an action may
+  # have inputs in /usr/include, which are not in the source tree.
+  if depth > len(base_path_components):
+    return ''
+  if depth == len(base_path_components):
+    return path
+  return '/'.join(base_path_components[0:len(base_path_components) - depth]) + \
+      '/' + path
 
 def __AddSources(sources, base_path, base_path_components, result):
   """Extracts valid sources from |sources| and adds them to |result|. Each
@@ -65,28 +70,44 @@ def __AddSources(sources, base_path, base_path_components, result):
     if not len(source) or source.startswith('!!!') or source.startswith('$'):
       continue
     # variable expansion may lead to //.
+    org_source = source
     source = source[0] + source[1:].replace('//', '/')
     if source.startswith('../'):
-      path_components = base_path_components[:]
-      # Resolve relative paths.
-      while source.startswith('../'):
-        path_components.pop(len(path_components) - 1)
-        source = source[3:]
-      result.append('/'.join(path_components) + source)
+      source = __ResolveParent(source, base_path_components)
+      if len(source):
+        result.append(source)
       continue
     result.append(base_path + source)
+    if debug:
+      print 'AddSource', org_source, result[len(result) - 1]
 
 def __ExtractSourcesFromAction(action, base_path, base_path_components,
                                results):
   if 'inputs' in action:
     __AddSources(action['inputs'], base_path, base_path_components, results)
 
-def __ExtractSources(target, target_dict):
-  base_path = posixpath.dirname(target)
+def __ExtractSources(target, target_dict, toplevel_dir):
+  # |target| is either absolute or relative and in the format of the OS. Gyp
+  # source paths are always posix. Convert |target| to a posix path relative to
+  # |toplevel_dir_|. This is done to make it easy to build source paths.
+  if os.sep == '\\' and os.altsep == '/':
+    base_path = target.replace('\\', '/')
+  else:
+    base_path = target
+  if base_path == toplevel_dir:
+    base_path = ''
+  elif base_path.startswith(toplevel_dir + '/'):
+    base_path = base_path[len(toplevel_dir) + len('/'):]
+  base_path = posixpath.dirname(base_path)
   base_path_components = base_path.split('/')
+
   # Add a trailing '/' so that __AddSources() can easily build paths.
   if len(base_path):
     base_path += '/'
+
+  if debug:
+    print 'ExtractSources', target, base_path
+
   results = []
   if 'sources' in target_dict:
     __AddSources(target_dict['sources'], base_path, base_path_components,
@@ -112,29 +133,27 @@ class Target(object):
     self.sources = []
     self.deps = []
 
-def __GenerateTargets(target_list, target_dicts):
+def __GenerateTargets(target_list, target_dicts, toplevel_dir):
   """Generates a dictionary with the key the name of a target and the value a
-  Target."""
+  Target. |toplevel_dir| is the root of the source tree."""
   targets = {}
 
   # Queue of targets to visit.
   targets_to_visit = target_list[:]
 
   while len(targets_to_visit) > 0:
-    absolute_target_name = targets_to_visit.pop()
-    # |absolute_target| may be an absolute path and may include #target.
-    # References to targets are relative, so we need to clean the name.
-    relative_target_name = __MakeRelativeTargetName(absolute_target_name)
-    if relative_target_name in targets:
+    target_name = targets_to_visit.pop()
+    if target_name in targets:
       continue
 
     target = Target()
-    targets[relative_target_name] = target
-    target.sources.extend(__ExtractSources(relative_target_name,
-                                           target_dicts[absolute_target_name]))
+    targets[target_name] = target
+    target.sources.extend(__ExtractSources(target_name,
+                                           target_dicts[target_name],
+                                           toplevel_dir))
 
-    for dep in target_dicts[absolute_target_name].get('dependencies', []):
-      targets[relative_target_name].deps.append(__MakeRelativeTargetName(dep))
+    for dep in target_dicts[target_name].get('dependencies', []):
+      targets[target_name].deps.append(dep)
       targets_to_visit.append(dep)
 
   return targets
@@ -166,6 +185,15 @@ def CalculateVariables(default_variables, params):
     default_variables.setdefault('OS', 'mac')
   elif flavor == 'win':
     default_variables.setdefault('OS', 'win')
+    # Copy additional generator configuration data from VS, which is shared
+    # by the Windows Ninja generator.
+    import gyp.generator.msvs as msvs_generator
+    generator_additional_non_configuration_keys = getattr(msvs_generator,
+        'generator_additional_non_configuration_keys', [])
+    generator_additional_path_sections = getattr(msvs_generator,
+        'generator_additional_path_sections', [])
+
+    gyp.msvs_emulation.CalculateCommonVariables(default_variables, params)
   else:
     operating_system = flavor
     if flavor == 'android':
@@ -179,7 +207,12 @@ def GenerateOutput(target_list, target_dicts, data, params):
     print 'Must specify files to analyze via file_path generator flag'
     return
 
-  targets = __GenerateTargets(target_list, target_dicts)
+  toplevel_dir = os.path.abspath(params['options'].toplevel_dir)
+  if os.sep == '\\' and os.altsep == '/':
+    toplevel_dir = toplevel_dir.replace('\\', '/')
+  if debug:
+    print 'toplevel_dir', toplevel_dir
+  targets = __GenerateTargets(target_list, target_dicts, toplevel_dir)
 
   files_set = frozenset(files)
   found_in_all_sources = 0
@@ -187,6 +220,8 @@ def GenerateOutput(target_list, target_dicts, data, params):
     sources = files_set.intersection(target.sources)
     if len(sources):
       print 'Found dependency'
+      if debug:
+        print 'Found dependency in', target_name, target.sources
       return
 
   print 'No dependencies'
