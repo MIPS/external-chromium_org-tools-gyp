@@ -503,9 +503,16 @@ class AndroidMkWriter(object):
 
       self.WriteLn('\n# Flags passed to only C++ (and not C) files.')
       self.WriteList(config.get('cflags_cc'), 'LOCAL_CPPFLAGS_%s' % configname)
+      if int(config.get('android_enable_fdo', 0)):
+        use_fdo = 'true'
+      else:
+        use_fdo = 'false'
+      self.WriteLn('\nLOCAL_FDO_SUPPORT_%s := %s' % (configname, use_fdo))
 
     self.WriteLn('\nLOCAL_CFLAGS := $(MY_CFLAGS_$(GYP_CONFIGURATION)) '
                  '$(MY_DEFS_$(GYP_CONFIGURATION))')
+    self.WriteLn(
+        'LOCAL_FDO_SUPPORT := $(LOCAL_FDO_SUPPORT_$(GYP_CONFIGURATION))')
     # Undefine ANDROID for host modules
     # TODO: the source code should not use macro ANDROID to tell if it's host
     # or target module.
