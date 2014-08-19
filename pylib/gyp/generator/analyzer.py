@@ -64,16 +64,17 @@ for unused in ['RULE_INPUT_PATH', 'RULE_INPUT_ROOT', 'RULE_INPUT_NAME',
                'CONFIGURATION_NAME']:
   generator_default_variables[unused] = ''
 
-def __ExtractBasePath(target):
-  """Extracts the path components of the specified gyp target path."""
-  last_index = target.rfind('/')
-  if last_index == -1:
-    return ''
-  return target[0:(last_index + 1)]
 
-def __ResolveParent(path, base_path_components):
+def _ToGypPath(path):
+  """Converts a path to the format used by gyp."""
+  if os.sep == '\\' and os.altsep == '/':
+    return path.replace('\\', '/')
+  return path
+
+
+def _ResolveParent(path, base_path_components):
   """Resolves |path|, which starts with at least one '../'. Returns an empty
-  string if the path shouldn't be considered. See __AddSources() for a
+  string if the path shouldn't be considered. See _AddSources() for a
   description of |base_path_components|."""
   depth = 0
   while path.startswith('../'):
@@ -88,7 +89,8 @@ def __ResolveParent(path, base_path_components):
   return '/'.join(base_path_components[0:len(base_path_components) - depth]) + \
       '/' + path
 
-def __AddSources(sources, base_path, base_path_components, result):
+
+def _AddSources(sources, base_path, base_path_components, result):
   """Extracts valid sources from |sources| and adds them to |result|. Each
   source file is relative to |base_path|, but may contain '..'. To make
   resolving '..' easier |base_path_components| contains each of the
@@ -103,7 +105,7 @@ def __AddSources(sources, base_path, base_path_components, result):
     org_source = source
     source = source[0] + source[1:].replace('//', '/')
     if source.startswith('../'):
-      source = __ResolveParent(source, base_path_components)
+      source = _ResolveParent(source, base_path_components)
       if len(source):
         result.append(source)
       continue
@@ -111,19 +113,18 @@ def __AddSources(sources, base_path, base_path_components, result):
     if debug:
       print 'AddSource', org_source, result[len(result) - 1]
 
-def __ExtractSourcesFromAction(action, base_path, base_path_components,
-                               results):
-  if 'inputs' in action:
-    __AddSources(action['inputs'], base_path, base_path_components, results)
 
-def __ExtractSources(target, target_dict, toplevel_dir):
+def _ExtractSourcesFromAction(action, base_path, base_path_components,
+                              results):
+  if 'inputs' in action:
+    _AddSources(action['inputs'], base_path, base_path_components, results)
+
+
+def _ExtractSources(target, target_dict, toplevel_dir):
   # |target| is either absolute or relative and in the format of the OS. Gyp
   # source paths are always posix. Convert |target| to a posix path relative to
   # |toplevel_dir_|. This is done to make it easy to build source paths.
-  if os.sep == '\\' and os.altsep == '/':
-    base_path = target.replace('\\', '/')
-  else:
-    base_path = target
+  base_path = _ToGypPath(target)
   if base_path == toplevel_dir:
     base_path = ''
   elif base_path.startswith(toplevel_dir + '/'):
@@ -131,7 +132,7 @@ def __ExtractSources(target, target_dict, toplevel_dir):
   base_path = posixpath.dirname(base_path)
   base_path_components = base_path.split('/')
 
-  # Add a trailing '/' so that __AddSources() can easily build paths.
+  # Add a trailing '/' so that _AddSources() can easily build paths.
   if len(base_path):
     base_path += '/'
 
@@ -140,19 +141,20 @@ def __ExtractSources(target, target_dict, toplevel_dir):
 
   results = []
   if 'sources' in target_dict:
-    __AddSources(target_dict['sources'], base_path, base_path_components,
-                 results)
+    _AddSources(target_dict['sources'], base_path, base_path_components,
+                results)
   # Include the inputs from any actions. Any changes to these effect the
   # resulting output.
   if 'actions' in target_dict:
     for action in target_dict['actions']:
-      __ExtractSourcesFromAction(action, base_path, base_path_components,
-                                 results)
+      _ExtractSourcesFromAction(action, base_path, base_path_components,
+                                results)
   if 'rules' in target_dict:
     for rule in target_dict['rules']:
-      __ExtractSourcesFromAction(rule, base_path, base_path_components, results)
+      _ExtractSourcesFromAction(rule, base_path, base_path_components, results)
 
   return results
+
 
 class Target(object):
   """Holds information about a particular target:
@@ -161,6 +163,7 @@ class Target(object):
   def __init__(self):
     self.deps = set()
     self.match_status = MATCH_STATUS_TBD
+
 
 class Config(object):
   """Details what we're looking for
@@ -216,7 +219,32 @@ class Config(object):
     except IOError:
       raise Exception('Unable to open file', file_path)
 
-def __GenerateTargets(target_list, target_dicts, toplevel_dir, files):
+
+def _WasBuildFileModified(build_file, data, files):
+  """Returns true if the build file |build_file| is either in |files| or
+  one of the files included by |build_file| is in |files|."""
+  if _ToGypPath(build_file) in files:
+    if debug:
+      print 'gyp file modified', build_file
+    return True
+
+  # First element of included_files is the file itself.
+  if len(data[build_file]['included_files']) <= 1:
+    return False
+
+  for include_file in data[build_file]['included_files'][1:]:
+    # |included_files| are relative to the directory of the |build_file|.
+    rel_include_file = \
+        _ToGypPath(gyp.common.UnrelativePath(include_file, build_file))
+    if rel_include_file in files:
+      if debug:
+        print 'included gyp file modified, gyp_file=', build_file, \
+            'included file=', rel_include_file
+      return True
+  return False
+
+
+def _GenerateTargets(data, target_list, target_dicts, toplevel_dir, files):
   """Generates a dictionary with the key the name of a target and the value a
   Target. |toplevel_dir| is the root of the source tree. If the sources of
   a target match that of |files|, then |target.matched| is set to True.
@@ -229,6 +257,10 @@ def __GenerateTargets(target_list, target_dicts, toplevel_dir, files):
 
   matched = False
 
+  # Maps from build file to a boolean indicating whether the build file is in
+  # |files|.
+  build_file_in_files = {}
+
   while len(targets_to_visit) > 0:
     target_name = targets_to_visit.pop()
     if target_name in targets:
@@ -236,19 +268,32 @@ def __GenerateTargets(target_list, target_dicts, toplevel_dir, files):
 
     target = Target()
     targets[target_name] = target
-    sources = __ExtractSources(target_name, target_dicts[target_name],
-                               toplevel_dir)
-    for source in sources:
-      if source in files:
-        target.match_status = MATCH_STATUS_MATCHES
-        matched = True
-        break
+
+    build_file = gyp.common.ParseQualifiedTarget(target_name)[0]
+    if not build_file in build_file_in_files:
+      build_file_in_files[build_file] = \
+          _WasBuildFileModified(build_file, data, files)
+
+    # If a build file (or any of its included files) is modified we assume all
+    # targets in the file are modified.
+    if build_file_in_files[build_file]:
+      target.match_status = MATCH_STATUS_MATCHES
+      matched = True
+    else:
+      sources = _ExtractSources(target_name, target_dicts[target_name],
+                                toplevel_dir)
+      for source in sources:
+        if source in files:
+          target.match_status = MATCH_STATUS_MATCHES
+          matched = True
+          break
 
     for dep in target_dicts[target_name].get('dependencies', []):
       targets[target_name].deps.add(dep)
       targets_to_visit.append(dep)
 
   return targets, matched
+
 
 def _GetUnqualifiedToQualifiedMapping(all_targets, to_find):
   """Returns a mapping (dictionary) from unqualified name to qualified name for
@@ -265,6 +310,7 @@ def _GetUnqualifiedToQualifiedMapping(all_targets, to_find):
       if not to_find:
         return result
   return result
+
 
 def _DoesTargetDependOn(target, all_targets):
   """Returns true if |target| or any of its dependencies matches the supplied
@@ -285,6 +331,7 @@ def _DoesTargetDependOn(target, all_targets):
     dep_target.match_status = MATCH_STATUS_DOESNT_MATCH
   return False
 
+
 def _GetTargetsDependingOn(all_targets, possible_targets):
   """Returns the list of targets in |possible_targets| that depend (either
   directly on indirectly) on the matched files.
@@ -296,6 +343,7 @@ def _GetTargetsDependingOn(all_targets, possible_targets):
       # possible_targets was initially unqualified, keep it unqualified.
       found.append(gyp.common.ParseQualifiedTarget(target)[1])
   return found
+
 
 def _WriteOutput(params, **values):
   """Writes the output, either to stdout or a file is specified."""
@@ -310,6 +358,7 @@ def _WriteOutput(params, **values):
     f.close()
   except IOError as e:
     print 'Error writing to output file', output_path, str(e)
+
 
 def CalculateVariables(default_variables, params):
   """Calculate additional variables for use in the build (called by gyp)."""
@@ -333,6 +382,7 @@ def CalculateVariables(default_variables, params):
       operating_system = 'linux'  # Keep this legacy behavior for now.
     default_variables.setdefault('OS', operating_system)
 
+
 def GenerateOutput(target_list, target_dicts, data, params):
   """Called by gyp as the final stage. Outputs results."""
   config = Config()
@@ -345,15 +395,28 @@ def GenerateOutput(target_list, target_dicts, data, params):
       raise Exception('Must specify files to analyze via config_path generator '
                       'flag')
 
-    toplevel_dir = os.path.abspath(params['options'].toplevel_dir)
-    if os.sep == '\\' and os.altsep == '/':
-      toplevel_dir = toplevel_dir.replace('\\', '/')
+    toplevel_dir = _ToGypPath(os.path.abspath(params['options'].toplevel_dir))
     if debug:
       print 'toplevel_dir', toplevel_dir
 
-    all_targets, matched = __GenerateTargets(target_list, target_dicts,
-                                             toplevel_dir,
-                                             frozenset(config.files))
+    matched = False
+    matched_include = False
+
+    # If one of the modified files is an include file then everything is
+    # affected.
+    if params['options'].includes:
+      for include in params['options'].includes:
+        if _ToGypPath(include) in config.files:
+          if debug:
+            print 'include path modified', include
+          matched_include = True
+          matched = True
+          break
+
+    if not matched:
+      all_targets, matched = _GenerateTargets(data, target_list, target_dicts,
+                                              toplevel_dir,
+                                              frozenset(config.files))
 
     # Set of targets that refer to one of the files.
     if config.look_for_dependency_only:
@@ -361,7 +424,9 @@ def GenerateOutput(target_list, target_dicts, data, params):
       return
 
     warning = None
-    if matched:
+    if matched_include:
+      output_targets = config.targets
+    elif matched:
       unqualified_mapping = _GetUnqualifiedToQualifiedMapping(
           all_targets, config.targets)
       if len(unqualified_mapping) != len(config.targets):
